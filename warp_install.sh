@@ -3,18 +3,6 @@
 # ==============================================================================
 #  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.3)
 # ==============================================================================
-#  Base: v3.1 + distro-agnostic deps (PR #1)
-#  Merged from PR #2 (cherry-picked, reviewed):
-#    - wgcf download hygiene only: `-f` + tmp + `install` (NOT checksum
-#      verification — that was same-source theater; see step 3 comment)
-#    - Read prompts from /dev/tty (works under `curl ... | bash`)
-#    - `vps-warp update` self-updater
-#  Deliberately NOT taken from PR #2:
-#    - scan_endpoints (ICMP-RTT probing): wrong metric for a UDP/anti-DPI
-#      threat model, and 42 parallel pings hammer cheap VPS. Kept the
-#      original subnet/host/port randomization instead.
-#    - apt-only dependency install (regression vs. PR #1).
-# ==============================================================================
 
 APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
