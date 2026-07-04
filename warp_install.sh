@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.2)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.3)
 # ==============================================================================
 #  Base: v3.1 + distro-agnostic deps (PR #1)
 #  Merged from PR #2 (cherry-picked, reviewed):
