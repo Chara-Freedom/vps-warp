@@ -101,7 +101,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tagashi666/vps-warp/main/war
 {
   "tag": "warp-out",
   "protocol": "freedom",
-  "sendThrough": "<LOCAL_WARP_IP>",
+  "sendThrough": "<LOCAL_WARP_IP>"
 }
 ```
 
