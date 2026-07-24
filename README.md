@@ -70,9 +70,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tagashi666/vps-warp/main/war
 {
   "tag": "warp-out",
   "protocol": "freedom",
-  "settings": {
-    "domainStrategy": "UseIP"
-  },
   "streamSettings": {
     "sockopt": {
       "mark": 255
@@ -87,9 +84,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tagashi666/vps-warp/main/war
 {
   "tag": "warp-out",
   "protocol": "freedom",
-  "settings": {
-    "domainStrategy": "UseIP"
-  },
   "streamSettings": {
     "sockopt": {
       "interface": "warp",
@@ -108,9 +102,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tagashi666/vps-warp/main/war
   "tag": "warp-out",
   "protocol": "freedom",
   "sendThrough": "<LOCAL_WARP_IP>",
-  "settings": {
-    "domainStrategy": "UseIP"
-  }
 }
 ```
 
