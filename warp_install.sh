@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.4)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v3.5)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="3.4"
+SCRIPT_VERSION="3.5"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -31,6 +31,15 @@ WARP_FWMARK=255
 WARP_TABLE=51820
 WARP_MTU=1280
 WARP_MSS=$((WARP_MTU - 40))
+
+# Endpoint pool (TSPU/DPI evasion: what matters is entropy, not the lowest RTT).
+CF_SUBNETS=("188.114.96" "188.114.97")
+CF_PORTS=(2408 500 4500 1701)
+
+# How many port+endpoint re-rolls the installer tries to bring the egress
+# country in line with the server's (see cf_country). The watchdog keeps
+# trying afterwards, so this only bounds the install time.
+GEO_TRIES=10
 
 # Self-update source of truth. MUST point at YOUR repo — `vps-warp update`
 # downloads and runs this as root.
@@ -142,6 +151,11 @@ function t() {
             "start_err") echo "Не удалось поднять интерфейс. Смотрите: journalctl -u wg-quick@warp" ;;
             "handshake") echo "Ожидание ответа сети (Handshake)..." ;;
             "hs_ok") echo "Соединение установлено! Задержка:" ;;
+            "geo") echo "Проверка страны выхода WARP..." ;;
+            "geo_ok") echo "Страна выхода совпадает со страной сервера:" ;;
+            "geo_rerolls") echo "перебросов порта и endpoint:" ;;
+            "geo_skip") echo "Не удалось определить страну сервера или выхода — проверка пропущена, её повторит watchdog" ;;
+            "geo_fail") echo "Страна выхода не совпала со страной сервера (выход / сервер), watchdog продолжит попытки:" ;;
             "watchdog") echo "Установка Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog активирован" ;;
             "finish") echo "Установка завершена!" ;;
@@ -178,6 +192,11 @@ function t() {
             "start_err") echo "Interface failed to come up. See: journalctl -u wg-quick@warp" ;;
             "handshake") echo "Waiting for network handshake..." ;;
             "hs_ok") echo "Connection established! Latency:" ;;
+            "geo") echo "Checking WARP egress country..." ;;
+            "geo_ok") echo "Egress country matches the server:" ;;
+            "geo_rerolls") echo "port+endpoint re-rolls:" ;;
+            "geo_skip") echo "Could not determine the server or egress country — check skipped, the watchdog will retry it" ;;
+            "geo_fail") echo "Egress country does not match the server (egress / server), the watchdog will keep trying:" ;;
             "watchdog") echo "Installing Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog activated" ;;
             "finish") echo "Installation complete!" ;;
@@ -352,6 +371,68 @@ function relax_rp_filter() {
     rp_status="$(t "rp_fixed") (${touched[*]})"
 }
 
+# --- Egress country ---
+# Cloudflare hands each WARP session to one of the machines in the nearest data
+# centre, chosen by a hash of the OUTER tuple (our ip:port -> endpoint:port).
+# Some of those machines egress from addresses that Cloudflare itself
+# geolocates to another country: from a server in Tokyo, about half of the
+# tuples came out of 104.28.x addresses labelled DE, the rest JP. The same
+# tuple lands on the same machine every time; a new tuple is a new draw. The
+# WARP account plays no part — one account gave JP and DE on different tuples.
+#
+# Hence: pin ListenPort (otherwise the kernel picks a fresh port on every
+# `wg-quick up` and each restart, reboot or rotation re-rolls the country) and
+# re-roll port+endpoint until the egress country matches the server's own.
+
+# Two-letter country Cloudflare assigns to the source of this request. Extra
+# curl arguments pick the path (`--interface warp` = through the tunnel).
+# Prints nothing on any failure — callers treat empty as "unknown", never as
+# a mismatch.
+function cf_country() {
+    curl -4 -s -m 8 "$@" https://1.1.1.1/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '$1 == "loc" { print $2; exit }'
+}
+
+# A random UDP port in 20000–49999 that nothing is bound to. `ss` may be
+# missing on minimal images; a collision there is unlikely, and wg-quick would
+# fail loudly rather than silently.
+function random_free_port() {
+    local p
+    for _ in {1..20}; do
+        p=$(( 20000 + RANDOM % 30000 ))
+        command -v ss &>/dev/null && ss -Hlun "sport = :$p" 2>/dev/null | grep -q . && continue
+        break
+    done
+    echo "$p"
+}
+
+# Re-roll the outer tuple on the LIVE interface: a new listen port plus a
+# random endpoint, applied by dropping and re-adding the peer. Dropping the
+# peer resets the session, so the next packet does a fresh handshake on the
+# new tuple — traffic is back in ~0.2 s. Changing only the port keeps the old
+# session, which the new Cloudflare machine does not know: traffic then stalls
+# for 5+ s until WireGuard re-handshakes on its own.
+#
+# Deliberately NOT `systemctl restart`: wg-quick's PostDown removes the fwmark
+# rule, so marked traffic would leave the box unencapsulated while the tunnel
+# is down, and several draws back to back trip systemd's start rate limit
+# (5 starts / 10 s) and leave the unit failed — tunnel gone until a human
+# steps in. The peer swap keeps the interface and the rule in place.
+# The new values go into the config as well, so they survive a restart.
+function reroll_tuple() {
+    local conf="/etc/wireguard/${WARP_IFACE}.conf" port ep pub
+    pub=$(wg show "$WARP_IFACE" peers 2>/dev/null | head -1)
+    [[ -n "$pub" ]] || return 1
+    port=$(random_free_port)
+    ep="${CF_SUBNETS[RANDOM % ${#CF_SUBNETS[@]}]}.$(( RANDOM % 254 + 1 )):${CF_PORTS[RANDOM % ${#CF_PORTS[@]}]}"
+    wg set "$WARP_IFACE" listen-port "$port" peer "$pub" remove 2>/dev/null
+    wg set "$WARP_IFACE" peer "$pub" endpoint "$ep" allowed-ips 0.0.0.0/0 persistent-keepalive 15
+    # Persist what the kernel actually runs (the port change can fail if the
+    # port was grabbed in the meantime).
+    port=$(wg show "$WARP_IFACE" listen-port 2>/dev/null)
+    sed -i "s/^ListenPort = .*/ListenPort = ${port}/; s/^Endpoint = .*/Endpoint = ${ep}/" "$conf"
+}
+
 # --- Pre-flight Checks ---
 [[ $EUID -ne 0 ]] && fail "$(t "root_req")"
 
@@ -506,12 +587,15 @@ PersistentKeepalive = 15\
 # entropy, not the lowest ICMP RTT — hence no scan_endpoints pass.
 # $RANDOM instead of shuf: minimal/busybox images don't always ship shuf, and a
 # silently-empty RAND_* would write a malformed Endpoint line.
-CF_SUBNETS=("188.114.96" "188.114.97")
-CF_PORTS=(2408 500 4500 1701)
+# The pool itself (CF_SUBNETS / CF_PORTS) is defined at the top.
 RAND_SUBNET=${CF_SUBNETS[RANDOM % ${#CF_SUBNETS[@]}]}
 RAND_HOST=$(( RANDOM % 254 + 1 ))
 RAND_PORT=${CF_PORTS[RANDOM % ${#CF_PORTS[@]}]}
 sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
+
+# Pin the local port so a tuple with the right egress country survives
+# restarts and reboots (see the note above cf_country).
+sed -i "/^\[Interface\]/a ListenPort = $(random_free_port)" "$CONF"
 
 mkdir -p /etc/wireguard
 install -m 600 "$CONF" "/etc/wireguard/${WARP_IFACE}.conf"
@@ -551,6 +635,26 @@ for _ in {1..15}; do
     sleep 1
 done
 [[ $hs_ok -eq 0 ]] && warn "Handshake timeout. Interface is up, but connection might be blocked."
+
+# 8b. Egress country (see the note above cf_country)
+step "🌍 $(t "geo")"
+SERVER_CC=$(cf_country)
+WARP_CC=$(cf_country --interface "$WARP_IFACE")
+if [[ -z "$SERVER_CC" || -z "$WARP_CC" ]]; then
+    warn "$(t "geo_skip")"
+else
+    geo_rerolls=0
+    while [[ "$WARP_CC" != "$SERVER_CC" && $geo_rerolls -lt $GEO_TRIES ]]; do
+        geo_rerolls=$(( geo_rerolls + 1 ))
+        reroll_tuple
+        WARP_CC=$(cf_country --interface "$WARP_IFACE")
+    done
+    if [[ "$WARP_CC" == "$SERVER_CC" ]]; then
+        done_ "$(t "geo_ok") ${WARP_CC}$([[ $geo_rerolls -gt 0 ]] && echo " ($(t "geo_rerolls") ${geo_rerolls})")"
+    else
+        warn "$(t "geo_fail") ${WARP_CC:-?} / ${SERVER_CC}"
+    fi
+fi
 
 # 9. Systemd Watchdog (Triple Ping + Rotation Backoff)
 step "🤖 $(t "watchdog")"
@@ -608,34 +712,108 @@ healthy=1
 # When Cloudflare is blocked wholesale rather than at one endpoint, rotating
 # cannot help, and a fixed 3-minute retry means restarting WireGuard 480 times
 # a day — which is itself a signature worth flagging. Back off exponentially,
-# capped at 30 min, and reset the moment the link recovers.
+# capped at 30 min, and reset the moment the link recovers. A wrong egress
+# country (below) counts as a failure too, so a country Cloudflare cannot
+# serve from this data centre backs off the same way instead of churning.
 fails=0; last_rot=0
 [[ -f "$STATE_FILE" ]] && read -r fails last_rot < "$STATE_FILE" 2>/dev/null
 fails=${fails:-0}; last_rot=${last_rot:-0}
 
+# Two-letter country Cloudflare assigns to the source of this request; extra
+# curl arguments pick the path. Empty on any failure.
+cf_country() {
+    curl -4 -s -m 8 "$@" https://1.1.1.1/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '$1 == "loc" { print $2; exit }'
+}
+
+# --- Egress country ---
+# Cloudflare picks the egress machine by a hash of the outer tuple (our
+# ip:port -> endpoint:port), and some machines egress from addresses it
+# geolocates to another country. A healthy tunnel can therefore still come out
+# in the wrong country. Unknown on either side is NOT a mismatch: a failed
+# probe must never churn the tunnel.
+reason="down"
 if [[ $healthy -eq 1 ]]; then
-    [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
-    exit 0
+    server_cc=$(cf_country)
+    warp_cc=$(cf_country --interface "$IFACE")
+    if [[ -z "$server_cc" || -z "$warp_cc" || "$warp_cc" == "$server_cc" ]]; then
+        [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
+        exit 0
+    fi
+    reason="country"
 fi
 
 exp=$(( fails > 4 ? 4 : fails ))
 backoff=$(( 180 * (2 ** exp) ))
 [[ $backoff -gt 1800 ]] && backoff=1800
 if [[ $(( now - last_rot )) -lt $backoff ]]; then
-    echo "WARP Watchdog: still down (fail #${fails}), next rotation in $(( backoff - (now - last_rot) ))s"
+    if [[ "$reason" == "country" ]]; then
+        echo "WARP Watchdog: egress country ${warp_cc} != server ${server_cc} (fail #${fails}), next re-roll in $(( backoff - (now - last_rot) ))s"
+    else
+        echo "WARP Watchdog: still down (fail #${fails}), next rotation in $(( backoff - (now - last_rot) ))s"
+    fi
     exit 0
 fi
 
+# A new tuple = a random endpoint AND a random local port. ListenPort is pinned
+# in the config so the tuple survives restarts and reboots; changing it is what
+# actually re-rolls the egress machine.
 SUBNETS=("188.114.96" "188.114.97")
 PORTS=(2408 500 4500 1701)
-RAND_SUBNET=${SUBNETS[RANDOM % ${#SUBNETS[@]}]}
-RAND_HOST=$(( RANDOM % 254 + 1 ))
-RAND_PORT=${PORTS[RANDOM % ${#PORTS[@]}]}
+pick_tuple() {
+    local p
+    for _ in {1..20}; do
+        p=$(( 20000 + RANDOM % 30000 ))
+        command -v ss &>/dev/null && ss -Hlun "sport = :$p" 2>/dev/null | grep -q . && continue
+        break
+    done
+    NEW_PORT=$p
+    NEW_EP="${SUBNETS[RANDOM % ${#SUBNETS[@]}]}.$(( RANDOM % 254 + 1 )):${PORTS[RANDOM % ${#PORTS[@]}]}"
+}
+save_tuple() {
+    if grep -q '^ListenPort' "$CONF"; then
+        sed -i "s/^ListenPort = .*/ListenPort = ${NEW_PORT}/" "$CONF"
+    else
+        sed -i "/^\[Interface\]/a ListenPort = ${NEW_PORT}" "$CONF"
+    fi
+    sed -i "s/^Endpoint = .*/Endpoint = ${NEW_EP}/" "$CONF"
+}
 
-sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
+if [[ "$reason" == "country" ]]; then
+    # The tunnel is healthy, so re-roll it LIVE: drop and re-add the peer with
+    # a new port and endpoint. That resets the session and the next packet
+    # handshakes on the new tuple (~0.2 s). No systemctl restart here — its
+    # PostDown would drop the fwmark rule and leak marked traffic while the
+    # tunnel is down, and five restarts in a row trip systemd's start limit
+    # and leave the unit failed.
+    pub=$(wg show "$IFACE" peers 2>/dev/null | head -1)
+    # A tuple is a coin toss, so several draws per run usually settle it within
+    # one pass instead of leaving the wrong country up for backoff periods.
+    for try in 1 2 3 4 5; do
+        pick_tuple
+        wg set "$IFACE" listen-port "$NEW_PORT" peer "$pub" remove 2>/dev/null
+        wg set "$IFACE" peer "$pub" endpoint "$NEW_EP" allowed-ips 0.0.0.0/0 persistent-keepalive 15
+        NEW_PORT=$(wg show "$IFACE" listen-port 2>/dev/null)
+        save_tuple
+        got=$(cf_country --interface "$IFACE")
+        if [[ "$got" == "$server_cc" ]]; then
+            printf '0 %s\n' "$now" > "$STATE_FILE"
+            echo "WARP Watchdog: egress country was ${warp_cc}, server is ${server_cc}. Re-rolled to port ${NEW_PORT} -> ${NEW_EP}, egress now ${got} (try ${try})"
+            exit 0
+        fi
+    done
+    printf '%s %s\n' "$(( fails + 1 ))" "$now" > "$STATE_FILE"
+    echo "WARP Watchdog: egress country ${warp_cc} != server ${server_cc}, still ${got:-unknown} after 5 re-rolls. Backing off"
+    exit 0
+fi
+
+# The tunnel is down: rotate and restart, as before. The backoff above keeps
+# restarts at least 3 minutes apart.
+pick_tuple
+save_tuple
 systemctl restart "wg-quick@${IFACE}"
 printf '%s %s\n' "$(( fails + 1 ))" "$now" > "$STATE_FILE"
-echo "WARP Watchdog: connection lost (hs age ${age}s, ping_ok ${ping_ok}). Rotated to ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}"
+echo "WARP Watchdog: connection lost (hs age ${age}s, ping_ok ${ping_ok}). Rotated to port ${NEW_PORT} -> ${NEW_EP}"
 WDEOF
 chmod 700 "$APP_DIR/watchdog.sh"
 
@@ -708,9 +886,27 @@ random_endpoint() {
     echo "${subnets[RANDOM % ${#subnets[@]}]}.$(( RANDOM % 254 + 1 )):${ports[RANDOM % ${#ports[@]}]}"
 }
 
-function show_status {
-    clear
+# A random UDP port in 20000–49999 that nothing is bound to.
+random_free_port() {
+    local p
+    for _ in {1..20}; do
+        p=$(( 20000 + RANDOM % 30000 ))
+        command -v ss &>/dev/null && ss -Hlun "sport = :$p" 2>/dev/null | grep -q . && continue
+        break
+    done
+    echo "$p"
+}
 
+# Two-letter country Cloudflare assigns to the source of this request; extra
+# curl arguments pick the path. Empty on any failure.
+cf_country() {
+    curl -4 -s -m 5 "$@" https://1.1.1.1/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '$1 == "loc" { print $2; exit }'
+}
+
+function show_status {
+    # `clear` comes after the probes below (the country check can take a few
+    # seconds), so the previous screen stays up instead of a blank one.
     if systemctl is-active --quiet "wg-quick@${IFACE}"; then
         c_stat="${C_GRN}"; t_stat="● ACTIVE"
     else
@@ -751,11 +947,25 @@ function show_status {
         c_rp="${C_GRN}"; t_rp="$([[ $rp_eff -eq 0 ]] && echo "off (=0)" || echo "loose (=2)")"
     fi
 
+    # Egress country vs the server's own, as Cloudflare sees both. A mismatch is
+    # what the watchdog re-rolls; `vps-warp rotate` re-rolls it by hand.
+    server_cc=$(cf_country)
+    warp_cc=$(cf_country --interface "$IFACE")
+    if [[ -z "$server_cc" || -z "$warp_cc" ]]; then
+        c_geo="${C_GRY}"; t_geo="${warp_cc:-?} (server ${server_cc:-?})"
+    elif [[ "$warp_cc" == "$server_cc" ]]; then
+        c_geo="${C_GRN}"; t_geo="${warp_cc} (matches the server)"
+    else
+        c_geo="${C_YLW}"; t_geo="${warp_cc} — server is ${server_cc}, the watchdog will re-roll"
+    fi
+
+    clear
     echo -e "\n  ${C_BLD}⚡ VPS-WARP STATUS${C_RST} ${C_GRY}v${version}${C_RST}"
     echo -e "  ${C_GRY}───────────────────────────────────${C_RST}\n"
     echo -e "   ${C_GRY}Status:${C_RST}       ${c_stat}${t_stat}${C_RST}"
     echo -e "   ${C_GRY}Local IP:${C_RST}     ${C_CYN}${tunnel_ip:-"--"}${C_RST}"
     echo -e "   ${C_GRY}Cloudflare:${C_RST}   ${C_CYN}${endpoint:-"--"}${C_RST}"
+    echo -e "   ${C_GRY}Egress:${C_RST}       ${c_geo}${t_geo}${C_RST}"
     echo -e "   ${C_GRY}Handshake:${C_RST}    ${c_hs}${t_hs}${C_RST}"
     echo -e "   ${C_GRY}Routing:${C_RST}      ${c_rule}${t_rule}${C_RST}"
     echo -e "   ${C_GRY}rp_filter:${C_RST}    ${c_rp}${t_rp}${C_RST}"
@@ -764,18 +974,33 @@ function show_status {
     echo -e "   ${C_GRY}Commands:${C_RST} start | stop | restart | rotate | log | update | uninstall\n"
 }
 
-# Force a new Cloudflare endpoint. `restart` deliberately does NOT do this —
-# keeping a working endpoint across restarts is usually what you want.
+# Force a new Cloudflare endpoint AND a new local port, i.e. a new outer tuple
+# and with it a new egress machine. `restart` deliberately does NOT do this —
+# keeping a working tuple across restarts is usually what you want.
 function rotate_endpoint {
-    local ep
+    local ep port pub
     ep=$(random_endpoint)
+    port=$(random_free_port)
+    pub=$(wg show "$IFACE" peers 2>/dev/null | head -1)
+    if [[ -n "$pub" ]]; then
+        # Tunnel is up: swap the tuple live (drop and re-add the peer) instead
+        # of restarting, so the fwmark rule never goes away (see the watchdog).
+        wg set "$IFACE" listen-port "$port" peer "$pub" remove 2>/dev/null
+        wg set "$IFACE" peer "$pub" endpoint "$ep" allowed-ips 0.0.0.0/0 persistent-keepalive 15
+        port=$(wg show "$IFACE" listen-port 2>/dev/null)
+    fi
+    if grep -q '^ListenPort' "$CONF"; then
+        sed -i "s/^ListenPort = .*/ListenPort = ${port}/" "$CONF"
+    else
+        sed -i "/^\[Interface\]/a ListenPort = ${port}" "$CONF"
+    fi
     sed -i "s/^Endpoint = .*/Endpoint = ${ep}/" "$CONF" || {
         echo -e "  ${C_RED}✖ Error:${C_RST} cannot write $CONF"; exit 1; }
-    systemctl restart "wg-quick@${IFACE}"
+    [[ -n "$pub" ]] || systemctl restart "wg-quick@${IFACE}"
     # A manual rotation means the operator is intervening; clear the backoff so
     # the watchdog isn't still sitting in a 30-minute cooldown afterwards.
     rm -f "${STATE_DIR}/watchdog.state"
-    echo -e "  ${C_GRN}✔${C_RST} Rotated to ${ep}"
+    echo -e "  ${C_GRN}✔${C_RST} Rotated to port ${port} -> ${ep}"
     sleep 2
     show_status
 }
