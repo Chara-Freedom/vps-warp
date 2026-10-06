@@ -45,9 +45,10 @@ GEO_TRIES=10
 # downloads and runs this as root.
 RAW_URL="https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh"
 
-# Used only if GitHub's /releases/latest redirect can't be resolved (blocked or
-# rate-limited). Bump occasionally so the fallback path doesn't rot.
-WGCF_FALLBACK_VERSION="v2.2.29"
+# Used if GitHub's /releases/latest redirect can't be resolved (blocked or
+# rate-limited), and as the retry when the latest wgcf cannot generate a profile
+# for an existing account (see step 4). Bump occasionally so it doesn't rot.
+WGCF_FALLBACK_VERSION="v2.2.32"
 
 # Persist WARP+ license to disk (0600) so `vps-warp update` keeps it without
 # re-entry. OFF by default: on a seized/compromised node the plaintext key is
@@ -137,6 +138,7 @@ function t() {
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
             "reg_err") echo "Регистрация не удалась: Cloudflare отклонил запросы (rate-limit или блокировка IP хостинга). Попробуйте позже или с другого IP." ;;
+            "gen_fallback") echo "wgcf не смог сгенерировать профиль для этого аккаунта, пробуем запасную версию" ;;
             "plus_ask") echo "🔑 Введите ключ WARP+ (или нажмите Enter для бесплатной версии):" ;;
             "plus_keep_hint") echo "(Enter — оставить сохранённый ключ)" ;;
             "plus_apply") echo "Активация WARP+..." ;;
@@ -178,6 +180,7 @@ function t() {
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
             "reg_err") echo "Registration failed: Cloudflare rejected the requests (rate limit or host IP block). Retry later or from another IP." ;;
+            "gen_fallback") echo "wgcf could not generate a profile for this account, retrying with the fallback release" ;;
             "plus_ask") echo "🔑 Enter WARP+ key (or press Enter for free tier):" ;;
             "plus_keep_hint") echo "(Enter — keep the saved key)" ;;
             "plus_apply") echo "Activating WARP+..." ;;
@@ -445,14 +448,6 @@ print_logo
 # systemd is the running init, so this catches more than `command -v systemctl`.
 [[ -d /run/systemd/system ]] || warn "$(t "no_systemd")"
 
-# 1. Cleanup
-step "🗑️  $(t "clean")"
-systemctl disable "wg-quick@${WARP_IFACE}" --now &>/dev/null || true
-systemctl disable warp-watchdog.timer --now &>/dev/null || true
-rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/warp /etc/systemd/system/warp-watchdog.* &>/dev/null
-systemctl daemon-reload
-done_ "$(t "clean_ok")"
-
 # 2. Dependencies (distro-agnostic — see install_deps)
 step "📦 $(t "deps")"
 install_deps
@@ -479,12 +474,17 @@ if [[ "$WGCF_VERSION" != v* ]]; then
 fi
 ARCH=$(uname -m)
 [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && WGCF_ARCH="arm64" || WGCF_ARCH="amd64"
-WGCF_DL="https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${WGCF_ARCH}"
-
-WGCF_TMP=$(mktemp) || fail "mktemp failed"
-curl -fsSL "$WGCF_DL" -o "$WGCF_TMP" || { rm -f "$WGCF_TMP"; fail "Download failed: $WGCF_DL"; }
-install -m 0755 "$WGCF_TMP" /usr/local/bin/wgcf || { rm -f "$WGCF_TMP"; fail "Install failed"; }
-rm -f "$WGCF_TMP"
+# Download one wgcf release into /usr/local/bin/wgcf (also used by the
+# generate fallback in step 4).
+function install_wgcf() {
+    local ver="$1" url tmp
+    url="https://github.com/ViRb3/wgcf/releases/download/${ver}/wgcf_${ver#v}_linux_${WGCF_ARCH}"
+    tmp=$(mktemp) || fail "mktemp failed"
+    curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; fail "Download failed: $url"; }
+    install -m 0755 "$tmp" /usr/local/bin/wgcf || { rm -f "$tmp"; fail "Install failed"; }
+    rm -f "$tmp"
+}
+install_wgcf "$WGCF_VERSION"
 done_ "$(t "wgcf_ok") (v${WGCF_VERSION#v})"
 
 # 4. Registration (Protected from Rate Limits)
@@ -509,7 +509,18 @@ fi
 # original reported both as the same opaque message.
 [[ -f wgcf-account.toml ]] || fail "$(t "reg_err")"
 chmod 600 wgcf-account.toml
-wgcf generate &>/dev/null || fail "Config generation failed (wgcf generate)."
+# wgcf v2.3.0 (2026-09-18) moved to a newer Cloudflare API whose schema marks
+# `key_type` as required; devices registered by older wgcf don't carry it, so
+# `generate` fails with "no value given for required property key_type" — the
+# same class as wgcf issue #576 (`model`). An existing account is worth keeping
+# (it may hold WARP+), so retry once with the fallback release before failing.
+if ! wgcf generate &>/dev/null; then
+    [[ "$WGCF_VERSION" == "$WGCF_FALLBACK_VERSION" ]] && fail "Config generation failed (wgcf generate)."
+    warn "$(t "gen_fallback") (${WGCF_VERSION} → ${WGCF_FALLBACK_VERSION})"
+    install_wgcf "$WGCF_FALLBACK_VERSION"
+    WGCF_VERSION="$WGCF_FALLBACK_VERSION"
+    wgcf generate &>/dev/null || fail "Config generation failed (wgcf generate, ${WGCF_FALLBACK_VERSION})."
+fi
 done_ "$(t "reg_ok")"
 
 # 5. WARP+
@@ -597,16 +608,29 @@ sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "
 # restarts and reboots (see the note above cf_country).
 sed -i "/^\[Interface\]/a ListenPort = $(random_free_port)" "$CONF"
 
-mkdir -p /etc/wireguard
-install -m 600 "$CONF" "/etc/wireguard/${WARP_IFACE}.conf"
-rm -f "$CONF"
-
 # Must happen before the interface comes up: `default` is the template new
 # interfaces inherit from, so $WARP_IFACE picks up the relaxed value at creation.
 rp_status=""
 relax_rp_filter
 done_ "$(t "opt_ok")"
 [[ -n "$rp_status" ]] && done_ "$rp_status"
+
+# Cleanup of the previous install — deliberately only HERE, once the new
+# config is ready. It used to run first, so any failure in between (wgcf
+# download, registration, `wgcf generate`) left the box with the tunnel down
+# and the watchdog deleted. While wg-quick is down its PostDown has removed the
+# fwmark rule, so Xray's marked traffic leaves from the server's real IP; from
+# here to step 7 that window is now well under a second.
+step "🗑️  $(t "clean")"
+systemctl disable "wg-quick@${WARP_IFACE}" --now &>/dev/null || true
+systemctl disable warp-watchdog.timer --now &>/dev/null || true
+rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/warp /etc/systemd/system/warp-watchdog.* &>/dev/null
+systemctl daemon-reload
+done_ "$(t "clean_ok")"
+
+mkdir -p /etc/wireguard
+install -m 600 "$CONF" "/etc/wireguard/${WARP_IFACE}.conf"
+rm -f "$CONF"
 
 WARP_LOCAL_IP=$(grep -oP '(?<=Address = )[0-9.]+' "/etc/wireguard/${WARP_IFACE}.conf" | head -1)
 
