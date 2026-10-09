@@ -38,7 +38,7 @@ RAW_URL="https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install
 
 # Used if GitHub's /releases/latest redirect can't be resolved (blocked or
 # rate-limited), and as the retry when the latest wgcf cannot generate a profile
-# for an existing account (see step 4). Bump occasionally so it doesn't rot.
+# for an existing WARP+ account (see step 4). Bump occasionally so it doesn't rot.
 WGCF_FALLBACK_VERSION="v2.2.32"
 
 # Persist WARP+ license to disk (0600) so `vps-warp update` keeps it without
@@ -129,7 +129,8 @@ function t() {
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
             "reg_err") echo "Регистрация не удалась: Cloudflare отклонил запросы (rate-limit или блокировка IP хостинга). Попробуйте позже или с другого IP." ;;
-            "gen_fallback") echo "wgcf не смог сгенерировать профиль для этого аккаунта, пробуем запасную версию" ;;
+            "gen_reregister") echo "wgcf не смог сгенерировать профиль для этого аккаунта; WARP+ на нём нет, регистрируем новый" ;;
+            "gen_fallback") echo "wgcf не смог сгенерировать профиль, а на аккаунте может быть WARP+: пробуем запасную версию" ;;
             "plus_ask") echo "🔑 Введите ключ WARP+ (или нажмите Enter для бесплатной версии):" ;;
             "plus_keep_hint") echo "(Enter — оставить сохранённый ключ)" ;;
             "plus_apply") echo "Активация WARP+..." ;;
@@ -166,7 +167,8 @@ function t() {
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
             "reg_err") echo "Registration failed: Cloudflare rejected the requests (rate limit or host IP block). Retry later or from another IP." ;;
-            "gen_fallback") echo "wgcf could not generate a profile for this account, retrying with the fallback release" ;;
+            "gen_reregister") echo "wgcf could not generate a profile for this account; it has no WARP+, registering a new one" ;;
+            "gen_fallback") echo "wgcf could not generate a profile and the account may hold WARP+; retrying with the fallback release" ;;
             "plus_ask") echo "🔑 Enter WARP+ key (or press Enter for free tier):" ;;
             "plus_keep_hint") echo "(Enter — keep the saved key)" ;;
             "plus_apply") echo "Activating WARP+..." ;;
@@ -431,14 +433,38 @@ chmod 600 wgcf-account.toml
 # wgcf v2.3.0 (2026-09-18) moved to a newer Cloudflare API whose schema marks
 # `key_type` as required; devices registered by older wgcf don't carry it, so
 # `generate` fails with "no value given for required property key_type" — the
-# same class as wgcf issue #576 (`model`). An existing account is worth keeping
-# (it may hold WARP+), so retry once with the fallback release before failing.
+# same class as wgcf issue #576 (`model`). Only the device record is affected:
+# the account record that `wgcf status` reads still parses, so the plan can be
+# checked with the current release.
+#   - free: nothing on the account is worth an old binary, so it is replaced by
+#     a fresh one registered with the current release. If that registration
+#     fails, the old account file is put back and the install stops; the
+#     running tunnel is still untouched at this point (cleanup is in step 6).
+#   - WARP+ (or a plan that can't be read): the account is kept and the
+#     fallback release generates the profile. With PERSIST_LICENSE=0 the
+#     account file is the only place the WARP+ key survives an update.
 if ! wgcf generate &>/dev/null; then
     [[ "$WGCF_VERSION" == "$WGCF_FALLBACK_VERSION" ]] && fail "Config generation failed (wgcf generate)."
-    warn "$(t "gen_fallback") (${WGCF_VERSION} → ${WGCF_FALLBACK_VERSION})"
-    install_wgcf "$WGCF_FALLBACK_VERSION"
-    WGCF_VERSION="$WGCF_FALLBACK_VERSION"
-    wgcf generate &>/dev/null || fail "Config generation failed (wgcf generate, ${WGCF_FALLBACK_VERSION})."
+    ACCOUNT_TYPE=$(wgcf status 2>/dev/null | awk -F' *: *' '/^Account type/ {print $2; exit}')
+    if [[ "$ACCOUNT_TYPE" == "free" ]]; then
+        warn "$(t "gen_reregister")"
+        mv -f wgcf-account.toml wgcf-account.toml.old
+        for _ in {1..3}; do
+            timeout 40 bash -c 'yes | wgcf register' &>/dev/null && break
+            sleep 3
+        done
+        [[ -f wgcf-account.toml ]] \
+            || { mv -f wgcf-account.toml.old wgcf-account.toml; fail "$(t "reg_err")"; }
+        chmod 600 wgcf-account.toml
+        wgcf generate &>/dev/null \
+            || { mv -f wgcf-account.toml.old wgcf-account.toml; fail "Config generation failed (wgcf generate)."; }
+        rm -f wgcf-account.toml.old
+    else
+        warn "$(t "gen_fallback") (${ACCOUNT_TYPE:-?}; ${WGCF_VERSION} → ${WGCF_FALLBACK_VERSION})"
+        install_wgcf "$WGCF_FALLBACK_VERSION"
+        WGCF_VERSION="$WGCF_FALLBACK_VERSION"
+        wgcf generate &>/dev/null || fail "Config generation failed (wgcf generate, ${WGCF_FALLBACK_VERSION})."
+    fi
 fi
 done_ "$(t "reg_ok")"
 
