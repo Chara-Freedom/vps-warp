@@ -22,6 +22,10 @@ VERSION_FILE="${STATE_DIR}/version"
 LICENSE_FILE="${STATE_DIR}/license"
 WGCF_DIR="${STATE_DIR}/wgcf"
 WATCHDOG_STATE="${STATE_DIR}/watchdog.state"
+# Marker: the egress country check is off (installer flag --no-egress-check).
+# Read at run time by the watchdog and the CLI, so creating or removing it by
+# hand takes effect without a reinstall.
+EGRESS_OFF_FILE="${STATE_DIR}/no-egress-check"
 
 # Routing knobs. WARP_FWMARK must match what Xray marks its packets with
 # (sockopt.mark), otherwise the ip rule below never matches and traffic
@@ -158,6 +162,7 @@ function t() {
             "geo_rerolls") echo "перебросов порта и endpoint:" ;;
             "geo_skip") echo "Не удалось определить страну сервера или выхода — проверка пропущена, её повторит watchdog" ;;
             "geo_fail") echo "Страна выхода не совпала со страной сервера (выход / сервер), watchdog продолжит попытки:" ;;
+            "geo_off") echo "Проверка выключена (--no-egress-check), включить: --egress-check" ;;
             "watchdog") echo "Установка Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog активирован" ;;
             "finish") echo "Установка завершена!" ;;
@@ -200,6 +205,7 @@ function t() {
             "geo_rerolls") echo "port+endpoint re-rolls:" ;;
             "geo_skip") echo "Could not determine the server or egress country — check skipped, the watchdog will retry it" ;;
             "geo_fail") echo "Egress country does not match the server (egress / server), the watchdog will keep trying:" ;;
+            "geo_off") echo "Check is off (--no-egress-check), turn it back on with --egress-check" ;;
             "watchdog") echo "Installing Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog activated" ;;
             "finish") echo "Installation complete!" ;;
@@ -439,6 +445,26 @@ function reroll_tuple() {
 # --- Pre-flight Checks ---
 [[ $EUID -ne 0 ]] && fail "$(t "root_req")"
 
+# --- Options ---
+# --no-egress-check turns the egress country check off (installer and
+# watchdog), --egress-check turns it back on; without either, the previous
+# choice stands. It lives in STATE_DIR because `vps-warp update` re-runs this
+# script with no arguments.
+# Off is for setups where a different country is the very point of WARP (often
+# WARP chained into WARP, mostly on Russian hosts) — the check would keep
+# re-rolling it away — and for those where a mismatch simply does not matter.
+EGRESS_ARG=""
+for arg in "$@"; do
+    case "$arg" in
+        --no-egress-check|--egress-check) EGRESS_ARG="$arg" ;;
+        *) fail "Unknown option: $arg (supported: --no-egress-check, --egress-check)" ;;
+    esac
+done
+case "$EGRESS_ARG" in
+    --no-egress-check) mkdir -p "$STATE_DIR" && touch "$EGRESS_OFF_FILE" ;;
+    --egress-check)    rm -f "$EGRESS_OFF_FILE" ;;
+esac
+
 # --- Start ---
 select_language
 print_logo
@@ -604,8 +630,11 @@ RAND_HOST=$(( RANDOM % 254 + 1 ))
 RAND_PORT=${CF_PORTS[RANDOM % ${#CF_PORTS[@]}]}
 sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
 
-# Pin the local port so a tuple with the right egress country survives
-# restarts and reboots (see the note above cf_country).
+# Pin the local port. The outer tuple decides which Cloudflare machine our
+# traffic egresses from, i.e. the exit address and country; unpinned, every
+# `wg-quick up` would silently move the exit (see the note above cf_country).
+# Pinned with or without --no-egress-check: the check relies on it, and with
+# the check off it keeps an exit chosen by `vps-warp rotate`.
 sed -i "/^\[Interface\]/a ListenPort = $(random_free_port)" "$CONF"
 
 # Must happen before the interface comes up: `default` is the template new
@@ -662,21 +691,25 @@ done
 
 # 8b. Egress country (see the note above cf_country)
 step "🌍 $(t "geo")"
-SERVER_CC=$(cf_country)
-WARP_CC=$(cf_country --interface "$WARP_IFACE")
-if [[ -z "$SERVER_CC" || -z "$WARP_CC" ]]; then
-    warn "$(t "geo_skip")"
+if [[ -f "$EGRESS_OFF_FILE" ]]; then
+    done_ "$(t "geo_off")"
 else
-    geo_rerolls=0
-    while [[ "$WARP_CC" != "$SERVER_CC" && $geo_rerolls -lt $GEO_TRIES ]]; do
-        geo_rerolls=$(( geo_rerolls + 1 ))
-        reroll_tuple
-        WARP_CC=$(cf_country --interface "$WARP_IFACE")
-    done
-    if [[ "$WARP_CC" == "$SERVER_CC" ]]; then
-        done_ "$(t "geo_ok") ${WARP_CC}$([[ $geo_rerolls -gt 0 ]] && echo " ($(t "geo_rerolls") ${geo_rerolls})")"
+    SERVER_CC=$(cf_country)
+    WARP_CC=$(cf_country --interface "$WARP_IFACE")
+    if [[ -z "$SERVER_CC" || -z "$WARP_CC" ]]; then
+        warn "$(t "geo_skip")"
     else
-        warn "$(t "geo_fail") ${WARP_CC:-?} / ${SERVER_CC}"
+        geo_rerolls=0
+        while [[ "$WARP_CC" != "$SERVER_CC" && $geo_rerolls -lt $GEO_TRIES ]]; do
+            geo_rerolls=$(( geo_rerolls + 1 ))
+            reroll_tuple
+            WARP_CC=$(cf_country --interface "$WARP_IFACE")
+        done
+        if [[ "$WARP_CC" == "$SERVER_CC" ]]; then
+            done_ "$(t "geo_ok") ${WARP_CC}$([[ $geo_rerolls -gt 0 ]] && echo " ($(t "geo_rerolls") ${geo_rerolls})")"
+        else
+            warn "$(t "geo_fail") ${WARP_CC:-?} / ${SERVER_CC}"
+        fi
     fi
 fi
 
@@ -693,6 +726,7 @@ chmod 700 "$APP_DIR" # Security: blocks local privilege escalation via the scrip
     printf 'IFACE=%q\n'      "$WARP_IFACE"
     printf 'FWMARK=%q\n'     "$WARP_FWMARK"
     printf 'STATE_FILE=%q\n' "$WATCHDOG_STATE"
+    printf 'EGRESS_OFF=%q\n' "$EGRESS_OFF_FILE"
     printf 'CONF=%q\n'       "/etc/wireguard/${WARP_IFACE}.conf"
 } > "$APP_DIR/watchdog.sh"
 
@@ -755,11 +789,15 @@ cf_country() {
 # ip:port -> endpoint:port), and some machines egress from addresses it
 # geolocates to another country. A healthy tunnel can therefore still come out
 # in the wrong country. Unknown on either side is NOT a mismatch: a failed
-# probe must never churn the tunnel.
+# probe must never churn the tunnel. With the check turned off
+# (--no-egress-check) nothing is probed and both stay unknown.
 reason="down"
 if [[ $healthy -eq 1 ]]; then
-    server_cc=$(cf_country)
-    warp_cc=$(cf_country --interface "$IFACE")
+    server_cc=""; warp_cc=""
+    if [[ ! -f "$EGRESS_OFF" ]]; then
+        server_cc=$(cf_country)
+        warp_cc=$(cf_country --interface "$IFACE")
+    fi
     if [[ -z "$server_cc" || -z "$warp_cc" || "$warp_cc" == "$server_cc" ]]; then
         [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
         exit 0
@@ -879,6 +917,7 @@ done_ "$(t "watchdog_ok")"
     printf 'RAW_URL=%q\n'      "$RAW_URL"
     printf 'VERSION_FILE=%q\n' "$VERSION_FILE"
     printf 'STATE_DIR=%q\n'    "$STATE_DIR"
+    printf 'EGRESS_OFF=%q\n'   "$EGRESS_OFF_FILE"
     printf 'APP_DIR=%q\n'      "$APP_DIR"
     printf 'IFACE=%q\n'        "$WARP_IFACE"
     printf 'FWMARK=%q\n'       "$WARP_FWMARK"
@@ -972,16 +1011,20 @@ function show_status {
     fi
 
     # Egress country vs the server's own, as Cloudflare sees both. A mismatch is
-    # what the watchdog re-rolls; `vps-warp rotate` re-rolls it by hand.
+    # what the watchdog re-rolls; `vps-warp rotate` re-rolls it by hand. With
+    # the check off (--no-egress-check) the line is informational only.
     server_cc=$(cf_country)
     warp_cc=$(cf_country --interface "$IFACE")
     if [[ -z "$server_cc" || -z "$warp_cc" ]]; then
         c_geo="${C_GRY}"; t_geo="${warp_cc:-?} (server ${server_cc:-?})"
     elif [[ "$warp_cc" == "$server_cc" ]]; then
         c_geo="${C_GRN}"; t_geo="${warp_cc} (matches the server)"
+    elif [[ -f "$EGRESS_OFF" ]]; then
+        c_geo="${C_GRY}"; t_geo="${warp_cc} — server is ${server_cc}"
     else
         c_geo="${C_YLW}"; t_geo="${warp_cc} — server is ${server_cc}, the watchdog will re-roll"
     fi
+    [[ -f "$EGRESS_OFF" ]] && t_geo+=", check off"
 
     clear
     echo -e "\n  ${C_BLD}⚡ VPS-WARP STATUS${C_RST} ${C_GRY}v${version}${C_RST}"
