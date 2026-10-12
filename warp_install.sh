@@ -485,14 +485,6 @@ print_logo
 # systemd is the running init, so this catches more than `command -v systemctl`.
 [[ -d /run/systemd/system ]] || warn "$(t "no_systemd")"
 
-# 1. Cleanup
-step "🗑️  $(t "clean")"
-systemctl disable "wg-quick@${WARP_IFACE}" --now &>/dev/null || true
-systemctl disable warp-watchdog.timer --now &>/dev/null || true
-rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/warp /etc/systemd/system/warp-watchdog.* &>/dev/null
-systemctl daemon-reload
-done_ "$(t "clean_ok")"
-
 # 2. Dependencies (distro-agnostic — see install_deps)
 step "📦 $(t "deps")"
 install_deps
@@ -640,10 +632,6 @@ WARP_EP=${OLD_EP:-$(random_endpoint)}
 sed -i "s/^Endpoint = .*/Endpoint = ${WARP_EP}/" "$CONF"
 sed -i "/^\[Interface\]/a ListenPort = ${WARP_PORT}" "$CONF"
 
-mkdir -p /etc/wireguard
-install -m 600 "$CONF" "/etc/wireguard/${WARP_IFACE}.conf"
-rm -f "$CONF"
-
 # Must happen before the interface comes up: `default` is the template new
 # interfaces inherit from, so $WARP_IFACE picks up the relaxed value at creation.
 rp_status=""
@@ -655,6 +643,23 @@ if [[ -n "$OLD_PORT" && -n "$OLD_EP" ]]; then
 else
     done_ "$(t "tuple_new") ${WARP_PORT} -> ${WARP_EP}"
 fi
+
+# Cleanup of the previous install — deliberately only HERE, once the new
+# config is ready. It used to run first, so any failure in between (wgcf
+# download, registration, `wgcf generate`) left the box with the tunnel down
+# and the watchdog deleted. While wg-quick is down its PostDown has removed the
+# fwmark rule, so Xray's marked traffic leaves from the server's real IP; from
+# here to step 7 that window is now well under a second.
+step "🗑️  $(t "clean")"
+systemctl disable "wg-quick@${WARP_IFACE}" --now &>/dev/null || true
+systemctl disable warp-watchdog.timer --now &>/dev/null || true
+rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/warp /etc/systemd/system/warp-watchdog.* &>/dev/null
+systemctl daemon-reload
+done_ "$(t "clean_ok")"
+
+mkdir -p /etc/wireguard
+install -m 600 "$CONF" "/etc/wireguard/${WARP_IFACE}.conf"
+rm -f "$CONF"
 
 WARP_LOCAL_IP=$(grep -oP '(?<=Address = )[0-9.]+' "/etc/wireguard/${WARP_IFACE}.conf" | head -1)
 
