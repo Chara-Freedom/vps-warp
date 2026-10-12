@@ -49,10 +49,6 @@ GEO_TRIES=10
 # downloads and runs this as root.
 RAW_URL="https://raw.githubusercontent.com/tagashi666/vps-warp/main/warp_install.sh"
 
-# Used only if GitHub's /releases/latest redirect can't be resolved (blocked or
-# rate-limited). Bump occasionally so the fallback path doesn't rot.
-WGCF_FALLBACK_VERSION="v2.2.29"
-
 # Persist WARP+ license to disk (0600) so `vps-warp update` keeps it without
 # re-entry. OFF by default: on a seized/compromised node the plaintext key is
 # an extra leak point. Set to 1 only if you accept that trade-off.
@@ -137,7 +133,7 @@ function t() {
             "no_systemd") echo "systemd не обнаружен — автозапуск туннеля и watchdog работать не будут (нужен ручной запуск/другой init)" ;;
             "wgcf") echo "Загрузка ядра wgcf..." ;;
             "wgcf_ok") echo "Ядро установлено" ;;
-            "wgcf_fallback") echo "Не удалось определить последнюю версию wgcf, используем запасную" ;;
+            "wgcf_resolve_err") echo "Не удалось узнать последнюю версию wgcf: GitHub не ответил. Текущая установка WARP не тронута, попробуйте позже." ;;
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
             "reg_err") echo "Регистрация не удалась: Cloudflare отклонил запросы (rate-limit или блокировка IP хостинга). Попробуйте позже или с другого IP." ;;
@@ -181,7 +177,7 @@ function t() {
             "no_systemd") echo "systemd not detected — tunnel autostart and watchdog will not work (manual start / other init needed)" ;;
             "wgcf") echo "Downloading wgcf core..." ;;
             "wgcf_ok") echo "Core installed" ;;
-            "wgcf_fallback") echo "Could not resolve latest wgcf version, using fallback" ;;
+            "wgcf_resolve_err") echo "Could not resolve the latest wgcf version: GitHub did not answer. The current WARP setup is untouched; retry later." ;;
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
             "reg_err") echo "Registration failed: Cloudflare rejected the requests (rate limit or host IP block). Retry later or from another IP." ;;
@@ -503,12 +499,11 @@ done_ "$(t "deps_ok")"
 step "⚙️  $(t "wgcf")"
 LATEST_URL=$(curl -Ls -m 20 -w "%{url_effective}" -o /dev/null "https://github.com/ViRb3/wgcf/releases/latest")
 WGCF_VERSION=$(basename "$LATEST_URL")
-# Resolution fails behind a censoring transit or on GitHub rate limits. Falling
-# back to a known-good tag beats hard-failing an otherwise fine install.
-if [[ "$WGCF_VERSION" != v* ]]; then
-    warn "$(t "wgcf_fallback") (${WGCF_FALLBACK_VERSION})"
-    WGCF_VERSION="$WGCF_FALLBACK_VERSION"
-fi
+# No pinned fallback tag: this lookup and the download below both go to
+# github.com over HTTPS, so whatever breaks one (a censor, a rate limit, no
+# route) breaks the other too. Stopping here is harmless: the previous install
+# is cleaned up only once the new config is ready (just before step 7).
+[[ "$WGCF_VERSION" == v* ]] || fail "$(t "wgcf_resolve_err")"
 ARCH=$(uname -m)
 [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && WGCF_ARCH="arm64" || WGCF_ARCH="amd64"
 WGCF_DL="https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${WGCF_ARCH}"
