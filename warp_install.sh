@@ -1467,7 +1467,7 @@ echo -e "\n  🎉 ${C_GRN}${C_BLD}$(t "finish")${C_RST}"
 echo -e "  📌 ${C_BLD}Xray / Remnawave Outbound IP:${C_RST} ${C_CYN}${WARP_LOCAL_IP}${C_RST} ${C_GRY}(use as 'sendThrough')${C_RST}"
 echo -e "  📌 ${C_BLD}fwmark for sockopt.mark:${C_RST} ${C_CYN}${WARP_FWMARK}${C_RST} ${C_GRY}(routes into table ${WARP_TABLE})${C_RST}"
 if [[ $USE_IPV6 -eq 1 ]]; then
-    echo -e "  📌 ${C_BLD}IPv6:${C_RST} ${C_CYN}on${C_RST} ${C_GRY}(Xray domainStrategy \"UseIPv4v6\" reaches IPv6-only sites too)${C_RST}"
+    echo -e "  📌 ${C_BLD}IPv6:${C_RST} ${C_CYN}on${C_RST} ${C_GRY}(Xray domainStrategy \"ForceIPv4v6\" reaches IPv6-only sites too)${C_RST}"
 else
     echo -e "  📌 ${C_BLD}IPv6:${C_RST} ${C_CYN}off${C_RST} ${C_GRY}(keep Xray domainStrategy \"ForceIPv4\", or IPv6 leaves outside WARP)${C_RST}"
 fi
