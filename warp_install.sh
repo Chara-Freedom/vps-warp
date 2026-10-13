@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.0)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.1)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.0"
+SCRIPT_VERSION="5.1"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -30,6 +30,9 @@ EGRESS_OFF_FILE="${STATE_DIR}/no-egress-check"
 # `vps-warp update` re-runs this script with no arguments.
 ACCOUNTS_FILE="${STATE_DIR}/accounts"
 MAX_ACCOUNTS=10
+# Marker: IPv6 through WARP is off (installer flag --no-ipv6). Read by the
+# installer only — the interface config changes, so it takes a reinstall.
+NO_IPV6_FILE="${STATE_DIR}/no-ipv6"
 
 # Routing knobs. WARP_FWMARK must match what Xray marks its packets with
 # (sockopt.mark), otherwise the ip rule below never matches and traffic
@@ -39,6 +42,7 @@ WARP_FWMARK=255
 WARP_TABLE=51820
 WARP_MTU=1280
 WARP_MSS=$((WARP_MTU - 40))
+WARP_MSS6=$((WARP_MTU - 60))
 
 # Several accounts (--accounts N). Cloudflare limits how many new connections
 # one WARP device accepts: past that it stops answering SYNs, and a second
@@ -177,6 +181,9 @@ function t() {
             "geo_skip") echo "Не удалось определить страну сервера или выхода — проверка пропущена, её повторит watchdog" ;;
             "geo_fail") echo "Страна выхода не совпала со страной сервера (выход / сервер), watchdog продолжит попытки:" ;;
             "geo_off") echo "Проверка выключена (--no-egress-check), включить: --egress-check" ;;
+            "v6_on") echo "IPv6 через WARP включён (выключить: --no-ipv6)" ;;
+            "v6_off") echo "IPv6 через WARP выключен (--no-ipv6), включить: --ipv6" ;;
+            "v6_kernel") echo "IPv6 в ядре выключен (disable_ipv6) — WARP только по IPv4" ;;
             "watchdog") echo "Установка Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog активирован" ;;
             "finish") echo "Установка завершена!" ;;
@@ -221,6 +228,9 @@ function t() {
             "geo_skip") echo "Could not determine the server or egress country — check skipped, the watchdog will retry it" ;;
             "geo_fail") echo "Egress country does not match the server (egress / server), the watchdog will keep trying:" ;;
             "geo_off") echo "Check is off (--no-egress-check), turn it back on with --egress-check" ;;
+            "v6_on") echo "IPv6 through WARP is on (turn off: --no-ipv6)" ;;
+            "v6_off") echo "IPv6 through WARP is off (--no-ipv6), turn it on with --ipv6" ;;
+            "v6_kernel") echo "IPv6 is disabled in the kernel (disable_ipv6) — WARP stays IPv4-only" ;;
             "watchdog") echo "Installing Smart Watchdog (Systemd)..." ;;
             "watchdog_ok") echo "Watchdog activated" ;;
             "finish") echo "Installation complete!" ;;
@@ -488,15 +498,20 @@ function state_of()    { [[ $1 -eq 1 ]] && echo "$WATCHDOG_STATE" || echo "${STA
 # --accounts N (1–$MAX_ACCOUNTS) sets how many WARP accounts share the traffic;
 # without it the previous number stands (1 on a first install). Both flags are
 # validated before anything on the box changes.
+#
+# --no-ipv6 keeps WARP IPv4-only, as every version before 5.1 did; --ipv6 turns
+# IPv6 back on. Without either, the previous choice stands (on by default).
 EGRESS_ARG=""
+IPV6_ARG=""
 ACCOUNTS_ARG=""
 ACCOUNTS_SET=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-egress-check|--egress-check) EGRESS_ARG="$1" ;;
+        --no-ipv6|--ipv6) IPV6_ARG="$1" ;;
         --accounts)   ACCOUNTS_SET=1; ACCOUNTS_ARG="${2:-}"; [[ $# -ge 2 ]] && shift ;;
         --accounts=*) ACCOUNTS_SET=1; ACCOUNTS_ARG="${1#*=}" ;;
-        *) fail "Unknown option: $1 (supported: --no-egress-check, --egress-check, --accounts N)" ;;
+        *) fail "Unknown option: $1 (supported: --no-egress-check, --egress-check, --no-ipv6, --ipv6, --accounts N)" ;;
     esac
     shift
 done
@@ -513,6 +528,28 @@ case "$EGRESS_ARG" in
     --no-egress-check) mkdir -p "$STATE_DIR" && touch "$EGRESS_OFF_FILE" ;;
     --egress-check)    rm -f "$EGRESS_OFF_FILE" ;;
 esac
+case "$IPV6_ARG" in
+    --no-ipv6) mkdir -p "$STATE_DIR" && touch "$NO_IPV6_FILE" ;;
+    --ipv6)    rm -f "$NO_IPV6_FILE" ;;
+esac
+
+# IPv6 through WARP. wgcf hands every device its own IPv6 address next to the
+# shared 172.16.0.2, and Cloudflare carries it fine: in our tests IPv6 lost
+# nothing and matched IPv4 on speed, and it reaches IPv6-only sites, which an
+# IPv4-only tunnel cannot. Google also judges the two protocols separately, so
+# IPv6 can pass where IPv4 is refused. The original stripped it citing
+# "blackhole routing at providers"; that never showed up, so 5.1 keeps it on.
+# Off with --no-ipv6, and off when the kernel has IPv6 disabled: wg-quick
+# could not even add the address there, and the interface would not come up.
+USE_IPV6=1
+V6_STATUS="v6_on"
+if [[ -f "$NO_IPV6_FILE" ]]; then
+    USE_IPV6=0; V6_STATUS="v6_off"
+elif [[ ! -d /proc/sys/net/ipv6 ]] \
+     || [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]] \
+     || [[ "$(cat /proc/sys/net/ipv6/conf/default/disable_ipv6 2>/dev/null)" == "1" ]]; then
+    USE_IPV6=0; V6_STATUS="v6_kernel"
+fi
 
 # --- Start ---
 select_language
@@ -664,11 +701,13 @@ function build_conf() {
     sed -i '/^MTU =/d'   "$conf"
     sed -i '/^Table =/d' "$conf"
 
-    # Blackhole Fix: drop IPv6 entirely
-    sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
-    sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
-    sed -i 's/,\s*::\/0//' "$conf"
-    sed -i '/AllowedIPs = ::\/0/d' "$conf"
+    # IPv4-only on --no-ipv6 (see USE_IPV6): drop the IPv6 address and route
+    if [[ $USE_IPV6 -eq 0 ]]; then
+        sed -i 's/,\s*[0-9a-fA-F:]\+\/128//' "$conf"
+        sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+        sed -i 's/,\s*::\/0//' "$conf"
+        sed -i '/AllowedIPs = ::\/0/d' "$conf"
+    fi
 
     # Inject routing into [Interface] (see the note above build_conf).
     sed -i "/^\[Interface\]/a\\
@@ -680,6 +719,12 @@ PostUp = iptables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags
 PostUp = iptables -t mangle -A POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS} || true\\
 PostDown = iptables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS} 2>/dev/null || true\\
 " "$conf"
+    if [[ $USE_IPV6 -eq 1 ]]; then
+        sed -i "/^PostDown = iptables /a\\
+PostUp = ip6tables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} 2>/dev/null || true\\
+PostUp = ip6tables -t mangle -A POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} || true\\
+PostDown = ip6tables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} 2>/dev/null || true" "$conf"
+    fi
 
     # Inject Keepalive into [Peer]
     sed -i '/^\[Peer\]/a\
@@ -711,6 +756,7 @@ rp_status=""
 relax_rp_filter
 done_ "$(t "opt_ok")"
 [[ -n "$rp_status" ]] && done_ "$rp_status"
+if [[ "$V6_STATUS" == "v6_kernel" ]]; then warn "$(t "$V6_STATUS")"; else done_ "$(t "$V6_STATUS")"; fi
 
 # Cleanup of the previous install — deliberately only HERE, once the new
 # configs are ready. It used to run first, so any failure in between (wgcf
@@ -745,6 +791,7 @@ chmod 700 "$APP_DIR" # Security: blocks local privilege escalation via the scrip
     printf 'FWMARK=%q\n'    "$WARP_FWMARK"
     printf 'TABLE=%q\n'     "$WARP_TABLE"
     printf 'DRAIN_DIR=%q\n' "$DRAIN_DIR"
+    printf 'IPV6=%q\n'      "$USE_IPV6"
 } > "$ROUTES_HELPER"
 
 cat >> "$ROUTES_HELPER" << 'RTEOF'
@@ -774,11 +821,15 @@ done
 # them all, the way a single tunnel that is down keeps its route.
 [[ ${#live[@]} -eq 0 ]] && live=("${up[@]}")
 
-rule_present() { ip rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${TABLE}"; }
+rule_present() { ip "$@" rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${TABLE}"; }
 
 if [[ ${#live[@]} -eq 0 ]]; then
     ip route flush table "$TABLE" 2>/dev/null
-    while rule_present; do ip rule del fwmark "$FWMARK" table "$TABLE" 2>/dev/null || break; done
+    while rule_present -4; do ip rule del fwmark "$FWMARK" table "$TABLE" 2>/dev/null || break; done
+    if [[ "$IPV6" == 1 ]]; then
+        ip -6 route flush table "$TABLE" 2>/dev/null
+        while rule_present -6; do ip -6 rule del fwmark "$FWMARK" table "$TABLE" 2>/dev/null || break; done
+    fi
     exit 0
 fi
 
@@ -789,7 +840,19 @@ else
     for i in "${live[@]}"; do hops+=(nexthop dev "$i" weight 1); done
     ip route replace default table "$TABLE" "${hops[@]}"
 fi
-rule_present || ip rule add fwmark "$FWMARK" table "$TABLE"
+rule_present -4 || ip rule add fwmark "$FWMARK" table "$TABLE"
+
+# IPv6 goes through ONE account, the first live one, and names its source
+# address. Unlike the shared 172.16.0.2, every WARP device has its own IPv6
+# address and Cloudflare takes packets only from it, so an IPv6 connection
+# hashed onto another account — after any rebuild of a multipath route — would
+# leave with the wrong source and die. IPv6 traffic is the small part anyway.
+if [[ "$IPV6" == 1 ]]; then
+    src=$(ip -6 -o addr show dev "${live[0]}" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    ip -6 route replace default dev "${live[0]}" table "$TABLE" ${src:+src "$src"} 2>/dev/null \
+        || ip -6 route replace default dev "${live[0]}" table "$TABLE"
+    rule_present -6 || ip -6 rule add fwmark "$FWMARK" table "$TABLE"
+fi
 exit 0
 RTEOF
 chmod 700 "$ROUTES_HELPER"
@@ -889,6 +952,7 @@ for (( k = 1; k <= ACCOUNTS; k++ )); do STATES+=("$(state_of "$k")"); done
     printf 'EGRESS_OFF=%q\n' "$EGRESS_OFF_FILE"
     printf 'ROUTES=%q\n'     "$ROUTES_HELPER"
     printf 'DRAIN_DIR=%q\n'  "$DRAIN_DIR"
+    printf 'IPV6=%q\n'       "$USE_IPV6"
 } > "$APP_DIR/watchdog.sh"
 
 cat >> "$APP_DIR/watchdog.sh" << 'WDEOF'
@@ -1056,6 +1120,10 @@ if [[ $changed -eq 0 ]]; then
         [[ -n "$(ip link show dev "$i" up 2>/dev/null)" ]] || continue
         ip rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${TABLE}" || changed=1
         ip route show table "$TABLE" 2>/dev/null | grep -q '^default' || changed=1
+        if [[ "$IPV6" == 1 ]]; then
+            ip -6 rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${TABLE}" || changed=1
+            ip -6 route show table "$TABLE" 2>/dev/null | grep -q '^default' || changed=1
+        fi
         [[ $changed -eq 1 ]] && echo "WARP Watchdog: fwmark rule or route was missing, rebuilt"
         break
     done
@@ -1110,6 +1178,8 @@ done_ "$(t "watchdog_ok")"
     printf 'FWMARK=%q\n'         "$WARP_FWMARK"
     printf 'WTABLE=%q\n'         "$WARP_TABLE"
     printf 'WMSS=%q\n'           "$WARP_MSS"
+    printf 'WMSS6=%q\n'          "$WARP_MSS6"
+    printf 'IPV6=%q\n'           "$USE_IPV6"
     printf 'DRAIN_DIR=%q\n'      "$DRAIN_DIR"
     printf 'RP_SYSCTL_FILE=%q\n' "$RP_SYSCTL_FILE"
     printf 'MP_SYSCTL_FILE=%q\n' "$MP_SYSCTL_FILE"
@@ -1155,7 +1225,7 @@ targets() {
 function show_status {
     local version server_cc i n=${#IFACES[@]} lines=()
     local c_stat t_stat tunnel_ip endpoint raw_stats rx_fmt tx_fmt hs_ts c_hs t_hs warp_cc c_geo t_geo
-    local c_rule t_rule hops rp_all rp_if rp_eff c_rp t_rp
+    local c_rule t_rule c_v6 t_v6 hops rp_all rp_if rp_eff c_rp t_rp
 
     # `clear` comes after the probes below (the country check can take a few
     # seconds), so the previous screen stays up instead of a blank one.
@@ -1224,6 +1294,17 @@ function show_status {
         c_rule="${C_GRN}"; t_rule="ok (fwmark ${FWMARK} → table ${WTABLE}$([[ $n -gt 1 ]] && echo ": ${hops}"))"
     fi
 
+    # IPv6 through WARP: the same rule and table, one account at a time.
+    if [[ "$IPV6" != 1 ]]; then
+        c_v6="${C_GRY}"; t_v6="off (IPv4 only)"
+    elif ! ip -6 rule show 2>/dev/null | grep -q "fwmark 0x$(printf '%x' "$FWMARK") lookup ${WTABLE}"; then
+        c_v6="${C_RED}"; t_v6="MISSING (fwmark ${FWMARK} → table ${WTABLE})"
+    elif ! ip -6 route show table "$WTABLE" 2>/dev/null | grep -q '^default'; then
+        c_v6="${C_RED}"; t_v6="NO ROUTE in table ${WTABLE}"
+    else
+        c_v6="${C_GRN}"; t_v6="ok (via $(ip -6 route show table "$WTABLE" 2>/dev/null | grep -oP '\bdev \K\S+' | head -1))"
+    fi
+
     # Kernel uses max(conf.all, conf.<iface>); reporting either one alone would
     # be misleading, so compute the value the kernel actually enforces on each
     # interface and show the worst: strict anywhere, else loose anywhere, else off.
@@ -1246,6 +1327,7 @@ function show_status {
     echo -e "  ${C_GRY}───────────────────────────────────${C_RST}\n"
     for i in "${lines[@]}"; do echo -e "$i"; done
     echo -e "   ${C_GRY}Routing:${C_RST}      ${c_rule}${t_rule}${C_RST}"
+    echo -e "   ${C_GRY}IPv6:${C_RST}         ${c_v6}${t_v6}${C_RST}"
     echo -e "   ${C_GRY}rp_filter:${C_RST}    ${c_rp}${t_rp}${C_RST}"
     echo -e "\n  ${C_GRY}───────────────────────────────────${C_RST}"
     echo -e "   ${C_GRY}Commands:${C_RST} start | stop | restart | rotate | log | update | uninstall\n"
@@ -1300,9 +1382,13 @@ function uninstall_self {
     # traffic.
     while ip rule del fwmark "$FWMARK" table "$WTABLE" 2>/dev/null; do :; done
     ip route flush table "$WTABLE" 2>/dev/null
+    while ip -6 rule del fwmark "$FWMARK" table "$WTABLE" 2>/dev/null; do :; done
+    ip -6 route flush table "$WTABLE" 2>/dev/null
     for i in "${IFACES[@]}"; do
         iptables -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
             --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WMSS" 2>/dev/null
+        ip6tables -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
+            --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WMSS6" 2>/dev/null
         ip link del "$i" 2>/dev/null
         rm -f "/etc/wireguard/${i}.conf"
     done
@@ -1380,6 +1466,11 @@ printf '%s\n' "$ACCOUNTS" > "$ACCOUNTS_FILE"
 echo -e "\n  🎉 ${C_GRN}${C_BLD}$(t "finish")${C_RST}"
 echo -e "  📌 ${C_BLD}Xray / Remnawave Outbound IP:${C_RST} ${C_CYN}${WARP_LOCAL_IP}${C_RST} ${C_GRY}(use as 'sendThrough')${C_RST}"
 echo -e "  📌 ${C_BLD}fwmark for sockopt.mark:${C_RST} ${C_CYN}${WARP_FWMARK}${C_RST} ${C_GRY}(routes into table ${WARP_TABLE})${C_RST}"
+if [[ $USE_IPV6 -eq 1 ]]; then
+    echo -e "  📌 ${C_BLD}IPv6:${C_RST} ${C_CYN}on${C_RST} ${C_GRY}(Xray domainStrategy \"UseIPv4v6\" reaches IPv6-only sites too)${C_RST}"
+else
+    echo -e "  📌 ${C_BLD}IPv6:${C_RST} ${C_CYN}off${C_RST} ${C_GRY}(keep Xray domainStrategy \"ForceIPv4\", or IPv6 leaves outside WARP)${C_RST}"
+fi
 if [[ $ACCOUNTS -gt 1 ]]; then
     echo -e "  📌 ${C_BLD}WARP accounts:${C_RST} ${C_CYN}${ACCOUNTS}${C_RST} ${C_GRY}(${IFACES[*]}; only sockopt.mark spreads over them)${C_RST}"
 fi
