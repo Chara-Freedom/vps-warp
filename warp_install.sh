@@ -490,16 +490,17 @@ function state_of()    { [[ $1 -eq 1 ]] && echo "$WATCHDOG_STATE" || echo "${STA
 # validated before anything on the box changes.
 EGRESS_ARG=""
 ACCOUNTS_ARG=""
+ACCOUNTS_SET=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-egress-check|--egress-check) EGRESS_ARG="$1" ;;
-        --accounts)   ACCOUNTS_ARG="${2:-}"; shift ;;
-        --accounts=*) ACCOUNTS_ARG="${1#*=}" ;;
+        --accounts)   ACCOUNTS_SET=1; ACCOUNTS_ARG="${2:-}"; [[ $# -ge 2 ]] && shift ;;
+        --accounts=*) ACCOUNTS_SET=1; ACCOUNTS_ARG="${1#*=}" ;;
         *) fail "Unknown option: $1 (supported: --no-egress-check, --egress-check, --accounts N)" ;;
     esac
     shift
 done
-if [[ -n "$ACCOUNTS_ARG" ]]; then
+if [[ $ACCOUNTS_SET -eq 1 ]]; then
     [[ "$ACCOUNTS_ARG" =~ ^[0-9]+$ && "$ACCOUNTS_ARG" -ge 1 && "$ACCOUNTS_ARG" -le $MAX_ACCOUNTS ]] \
         || fail "--accounts takes a number from 1 to ${MAX_ACCOUNTS}, got '${ACCOUNTS_ARG}'"
 fi
