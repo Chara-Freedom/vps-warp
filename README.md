@@ -3,7 +3,7 @@
 **Cloudflare WARP на вашем VPS без официального клиента.**  
 Нативный WireGuard + умный watchdog с авто-ротацией endpoint. Сделан для работы с Xray-core, Remnawave, 3X-UI и Marzban.
 
-Форк [tagashi666/vps-warp](https://github.com/tagashi666/vps-warp); с версии 5.0 развивается здесь.
+Форк [tagashi666/vps-warp](https://github.com/tagashi666/vps-warp); с версии 5.0 развивается здесь. Изменения этого форка написаны с помощью [Claude](https://claude.com) (Anthropic).
 
 ---
 
