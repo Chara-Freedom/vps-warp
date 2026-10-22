@@ -1091,7 +1091,7 @@ check_iface() {
         if [[ "$(cat "$mark" 2>/dev/null)" != slow ]]; then
             echo slow > "$mark"
             changed=1
-            echo "${P}: handshake and ping are fine, but ${PROBE[$IFACE]}+ of 8 test connections failed twice in a row while another account had at most 1 — out of the route until two clean runs. If it stays out, re-register the account (README: «Несколько аккаунтов»)"
+            echo "${P}: handshake and ping are fine, but ${PROBE[$IFACE]}+ of 8 test connections failed in two runs with no clean run between, while another account had at most 1 — out of the route until two clean runs. If it stays out, re-register the account (README: «Несколько аккаунтов»)"
         fi
         return 0
     fi
