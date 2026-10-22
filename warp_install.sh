@@ -983,6 +983,11 @@ changed=0
 # connections — the per-device limit, on one account of several. So every
 # account also opens a few real HTTPS connections through its own interface:
 # up to 8 requests to connectivity-check URLs, stopping at the 3rd failure.
+# A connection that took a second or more to open counts as a failure too:
+# through WARP the nearest Cloudflare machine accepts TCP within milliseconds,
+# so a second means the first SYN went unanswered and the kernel resent it —
+# exactly how the limit looks, while the retry still gets most connections
+# open within the timeout.
 # The verdict is relative: an account is "slow" only while another account gets
 # through (at most 1 failure), so an outage of the URLs or of the server's own
 # network drains nobody. Slow twice in a row = out of the route; back only
@@ -996,11 +1001,14 @@ PROBE_URLS=(
     https://www.apple.com/library/test/success.html
 )
 probe_fails() {
-    local i code fails=0
+    local i out code tc fails=0
     for (( i = 0; i < 8; i++ )); do
-        code=$(curl -4 -s -o /dev/null -m 5 --interface "$1" -w '%{http_code}' \
+        out=$(curl -4 -s -o /dev/null -m 5 --interface "$1" -w '%{http_code} %{time_connect}' \
             "${PROBE_URLS[i % ${#PROBE_URLS[@]}]}" 2>/dev/null)
-        [[ -z "$code" || "$code" == "000" ]] && fails=$(( fails + 1 ))
+        code=${out%% *}; tc=${out##* }; tc=${tc%%.*}
+        if [[ -z "$code" || "$code" == "000" || ${tc:-0} -ge 1 ]]; then
+            fails=$(( fails + 1 ))
+        fi
         [[ $fails -ge 3 ]] && break
     done
     echo "$fails"
