@@ -990,10 +990,12 @@ changed=0
 # open within the timeout.
 # The verdict is relative: an account is "slow" only while another account gets
 # through (at most 1 failure), so an outage of the URLs or of the server's own
-# network drains nobody. Slow twice in a row = out of the route; back only
-# after two clean runs (at most 1 failure each), so a half-working account does
-# not flap in and out. With one account there is nowhere to move its
-# connections, so nothing is probed.
+# network drains nobody. A run is "slow" (3+ failures while another account is
+# clean), "clean" (at most 1 failure) or in between; an in-between run changes
+# nothing, because a half-working account produces those too. Two slow runs
+# with no clean run between them = out of the route; back after two clean runs
+# with no slow run between them, so it does not flap in and out. With one
+# account there is nowhere to move its connections, so nothing is probed.
 PROBE_URLS=(
     https://www.google.com/generate_204
     https://connectivitycheck.gstatic.com/generate_204
@@ -1024,16 +1026,14 @@ if [[ ${#IFACES[@]} -gt 1 ]]; then
     done
     mkdir -p "$DRAIN_DIR"
     for i in "${!PROBE[@]}"; do
-        bad_file="${DRAIN_DIR}/${i}.slow"   # slow runs in a row
-        ok_file="${DRAIN_DIR}/${i}.ok"      # clean runs in a row, while out as slow
+        bad_file="${DRAIN_DIR}/${i}.slow"   # slow runs since the last clean one
+        ok_file="${DRAIN_DIR}/${i}.ok"      # clean runs since the last slow one
         bad=$(cat "$bad_file" 2>/dev/null); ok=$(cat "$ok_file" 2>/dev/null)
         bad=${bad:-0}; ok=${ok:-0}
         if [[ ${PROBE[$i]} -ge 3 && $best -le 1 ]]; then
             bad=$(( bad + 1 )); ok=0
         elif [[ ${PROBE[$i]} -le 1 ]]; then
             bad=0; ok=$(( ok + 1 ))
-        else
-            bad=0; ok=0
         fi
         echo "$bad" > "$bad_file"; echo "$ok" > "$ok_file"
         if [[ "$(cat "${DRAIN_DIR}/${i}" 2>/dev/null)" == slow ]]; then
