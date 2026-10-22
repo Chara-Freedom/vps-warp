@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.1)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.2)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.1"
+SCRIPT_VERSION="5.2"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -935,7 +935,7 @@ else
     done
 fi
 
-# 9. Systemd Watchdog (Triple Ping + Rotation Backoff)
+# 9. Systemd Watchdog (Triple Ping + Test Connections + Rotation Backoff)
 step "🤖 $(t "watchdog")"
 STATES=()
 for (( k = 1; k <= ACCOUNTS; k++ )); do STATES+=("$(state_of "$k")"); done
@@ -978,6 +978,64 @@ pick_endpoint() {
 # once, after all of them are checked.
 changed=0
 
+# --- Test connections (several accounts only) ---
+# Handshake and ping can both be fine on an account that loses most of its TCP
+# connections — the per-device limit, on one account of several. So every
+# account also opens a few real HTTPS connections through its own interface:
+# up to 8 requests to connectivity-check URLs, stopping at the 3rd failure.
+# The verdict is relative: an account is "slow" only while another account gets
+# through (at most 1 failure), so an outage of the URLs or of the server's own
+# network drains nobody. Slow twice in a row = out of the route; back only
+# after two clean runs (at most 1 failure each), so a half-working account does
+# not flap in and out. With one account there is nowhere to move its
+# connections, so nothing is probed.
+PROBE_URLS=(
+    https://www.google.com/generate_204
+    https://connectivitycheck.gstatic.com/generate_204
+    https://cp.cloudflare.com/generate_204
+    https://www.apple.com/library/test/success.html
+)
+probe_fails() {
+    local i code fails=0
+    for (( i = 0; i < 8; i++ )); do
+        code=$(curl -4 -s -o /dev/null -m 5 --interface "$1" -w '%{http_code}' \
+            "${PROBE_URLS[i % ${#PROBE_URLS[@]}]}" 2>/dev/null)
+        [[ -z "$code" || "$code" == "000" ]] && fails=$(( fails + 1 ))
+        [[ $fails -ge 3 ]] && break
+    done
+    echo "$fails"
+}
+
+declare -A PROBE=() SLOW=()
+if [[ ${#IFACES[@]} -gt 1 ]]; then
+    best=9
+    for i in "${IFACES[@]}"; do
+        systemctl is-active --quiet "wg-quick@${i}" || continue
+        PROBE[$i]=$(probe_fails "$i")
+        [[ ${PROBE[$i]} -lt $best ]] && best=${PROBE[$i]}
+    done
+    mkdir -p "$DRAIN_DIR"
+    for i in "${!PROBE[@]}"; do
+        bad_file="${DRAIN_DIR}/${i}.slow"   # slow runs in a row
+        ok_file="${DRAIN_DIR}/${i}.ok"      # clean runs in a row, while out as slow
+        bad=$(cat "$bad_file" 2>/dev/null); ok=$(cat "$ok_file" 2>/dev/null)
+        bad=${bad:-0}; ok=${ok:-0}
+        if [[ ${PROBE[$i]} -ge 3 && $best -le 1 ]]; then
+            bad=$(( bad + 1 )); ok=0
+        elif [[ ${PROBE[$i]} -le 1 ]]; then
+            bad=0; ok=$(( ok + 1 ))
+        else
+            bad=0; ok=0
+        fi
+        echo "$bad" > "$bad_file"; echo "$ok" > "$ok_file"
+        if [[ "$(cat "${DRAIN_DIR}/${i}" 2>/dev/null)" == slow ]]; then
+            [[ $ok -ge 2 ]] || SLOW[$i]=1
+        else
+            [[ $bad -ge 2 ]] && SLOW[$i]=1
+        fi
+    done
+fi
+
 # Every account is checked on its own: handshake age and a ping bound to its
 # interface. The ping does not go by fwmark: with several accounts the marked
 # path is a multipath route, and a probe on it tests whichever interface the
@@ -1017,6 +1075,19 @@ check_iface() {
     [[ $ping_ok -eq 0 ]] && healthy=0
 
     mark="${DRAIN_DIR}/${IFACE}"
+
+    # Alive by handshake and ping, but its test connections keep failing (see
+    # "Test connections" above): keep it out of the route. No rotation — a new
+    # endpoint did not cure this; re-registering the account did.
+    if [[ $healthy -eq 1 && -n "${SLOW[$IFACE]:-}" ]]; then
+        if [[ "$(cat "$mark" 2>/dev/null)" != slow ]]; then
+            echo slow > "$mark"
+            changed=1
+            echo "${P}: handshake and ping are fine, but ${PROBE[$IFACE]}+ of 8 test connections failed twice in a row while another account had at most 1 — out of the route until two clean runs. If it stays out, re-register the account (README: «Несколько аккаунтов»)"
+        fi
+        return 0
+    fi
+
     if [[ $healthy -eq 1 ]]; then
         if [[ -f "$mark" ]]; then
             rm -f "$mark"
@@ -1237,6 +1308,8 @@ function show_status {
             c_stat="${C_GRN}"; t_stat="● ACTIVE"
             if [[ $n -gt 1 && -f "${DRAIN_DIR}/${i}" ]]; then
                 c_stat="${C_YLW}"; t_stat="● ACTIVE, out of the route (the watchdog found it dead)"
+                [[ "$(cat "${DRAIN_DIR}/${i}" 2>/dev/null)" == slow ]] \
+                    && t_stat="● ACTIVE, out of the route (its test connections keep failing)"
             fi
         else
             c_stat="${C_RED}"; t_stat="○ INACTIVE"
