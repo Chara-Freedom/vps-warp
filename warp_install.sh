@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.2)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.3)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.2"
+SCRIPT_VERSION="5.3"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -467,13 +467,17 @@ function random_endpoint() {
 # (5 starts / 10 s) and leave the unit failed — tunnel gone until a human
 # steps in. The peer swap keeps the interface and the rule in place.
 # The new endpoint goes into the config as well, so it survives a restart.
+# The peer is re-added with the allowed IPs its config has: with IPv6 on that
+# includes ::/0, and a bare 0.0.0.0/0 here cut the account's IPv6 until the
+# next restart (5.1–5.2).
 function reroll_endpoint() {
-    local iface="$1" conf="/etc/wireguard/$1.conf" ep pub
+    local iface="$1" conf="/etc/wireguard/$1.conf" ep pub aips
     pub=$(wg show "$iface" peers 2>/dev/null | head -1)
     [[ -n "$pub" ]] || return 1
     ep=$(random_endpoint)
+    aips=$(awk -F'=' '/^AllowedIPs/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$conf")
     wg set "$iface" peer "$pub" remove 2>/dev/null
-    wg set "$iface" peer "$pub" endpoint "$ep" allowed-ips 0.0.0.0/0 persistent-keepalive 15
+    wg set "$iface" peer "$pub" endpoint "$ep" allowed-ips "${aips:-0.0.0.0/0}" persistent-keepalive 15
     sed -i "s/^Endpoint = .*/Endpoint = ${ep}/" "$conf"
 }
 
@@ -974,6 +978,22 @@ pick_endpoint() {
     NEW_EP="${SUBNETS[RANDOM % ${#SUBNETS[@]}]}.$(( RANDOM % 254 + 1 )):${PORTS[RANDOM % ${#PORTS[@]}]}"
 }
 
+# Put a new endpoint on the LIVE interface: drop and re-add the peer, which
+# resets the session so the next packet handshakes on the new tuple (~0.2 s),
+# and write it into the config. No systemctl restart — wg-quick's PostDown would
+# take the fwmark rule away meanwhile. The peer gets back the allowed IPs its
+# config has: with IPv6 on that includes ::/0, and re-adding it with a bare
+# 0.0.0.0/0 cut the account's IPv6 until the next restart (5.1–5.2).
+swap_endpoint() {   # iface, config, endpoint
+    local pub aips
+    pub=$(wg show "$1" peers 2>/dev/null | head -1)
+    [[ -n "$pub" ]] || return 1
+    aips=$(awk -F'=' '/^AllowedIPs/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$2")
+    wg set "$1" peer "$pub" remove 2>/dev/null
+    wg set "$1" peer "$pub" endpoint "$3" allowed-ips "${aips:-0.0.0.0/0}" persistent-keepalive 15
+    sed -i "s/^Endpoint = .*/Endpoint = $3/" "$2"
+}
+
 # Set when an interface was drained or came back; the shared route is rebuilt
 # once, after all of them are checked.
 changed=0
@@ -1054,7 +1074,7 @@ fi
 check_iface() {
     local IFACE="$1" STATE_FILE="$2" CONF="/etc/wireguard/$1.conf" P="WARP Watchdog"
     local hs_ts now age ping_ok healthy mark fails last_rot reason server_cc warp_cc
-    local exp backoff pub try got dst
+    local exp backoff try got dst rot
     [[ ${#IFACES[@]} -gt 1 ]] && P="WARP Watchdog [${IFACE}]"
 
     # Silent by design when the operator stopped the tunnel on purpose.
@@ -1085,13 +1105,24 @@ check_iface() {
     mark="${DRAIN_DIR}/${IFACE}"
 
     # Alive by handshake and ping, but its test connections keep failing (see
-    # "Test connections" above): keep it out of the route. No rotation — a new
-    # endpoint did not cure this; re-registering the account did.
+    # "Test connections" above): take it out of the route AND give it a new
+    # endpoint. Out of the route alone it recovers and breaks again as soon as
+    # it is back: in one case an account went out and back about 150 times in
+    # 2.5 days on the same endpoint, and the first new endpoint cured it — a
+    # stale path that only a new endpoint rebuilds. One new endpoint did not
+    # help in another case, so every new drain draws again instead of trusting
+    # a single draw. Live swap, no restart (see swap_endpoint).
     if [[ $healthy -eq 1 && -n "${SLOW[$IFACE]:-}" ]]; then
         if [[ "$(cat "$mark" 2>/dev/null)" != slow ]]; then
             echo slow > "$mark"
             changed=1
-            echo "${P}: handshake and ping are fine, but ${PROBE[$IFACE]}+ of 8 test connections failed in two runs with no clean run between, while another account had at most 1 — out of the route until two clean runs. If it stays out, re-register the account (README: «Несколько аккаунтов»)"
+            pick_endpoint
+            if swap_endpoint "$IFACE" "$CONF" "$NEW_EP"; then
+                rot="endpoint rotated to ${NEW_EP}"
+            else
+                rot="endpoint NOT rotated (no peer)"
+            fi
+            echo "${P}: handshake and ping are fine, but ${PROBE[$IFACE]}+ of 8 test connections failed in two runs with no clean run between, while another account had at most 1 — out of the route until two clean runs, ${rot}. If it keeps coming back out after several rotations, re-register the account (README: «Несколько аккаунтов»)"
         fi
         return 0
     fi
@@ -1156,14 +1187,11 @@ check_iface() {
         # a new endpoint. That resets the session and the next packet handshakes
         # on the new tuple (~0.2 s). No systemctl restart here — five restarts
         # in a row trip systemd's start limit and leave the unit failed.
-        pub=$(wg show "$IFACE" peers 2>/dev/null | head -1)
         # An endpoint is a coin toss, so several draws per run usually settle it
         # within one pass instead of leaving the wrong country up for backoff periods.
         for try in 1 2 3 4 5; do
             pick_endpoint
-            wg set "$IFACE" peer "$pub" remove 2>/dev/null
-            wg set "$IFACE" peer "$pub" endpoint "$NEW_EP" allowed-ips 0.0.0.0/0 persistent-keepalive 15
-            sed -i "s/^Endpoint = .*/Endpoint = ${NEW_EP}/" "$CONF"
+            swap_endpoint "$IFACE" "$CONF" "$NEW_EP"
             got=$(cf_country --interface "$IFACE")
             if [[ "$got" == "$server_cc" ]]; then
                 printf '0 %s\n' "$now" > "$STATE_FILE"
@@ -1420,7 +1448,7 @@ function show_status {
 # `restart` deliberately does NOT rotate — keeping a working endpoint across
 # restarts is usually what you want.
 function rotate_endpoint {
-    local i ep pub conf k
+    local i ep pub conf k aips
     local -a list
     mapfile -t list < <(targets "$1")
     [[ ${#list[@]} -gt 0 ]] || exit 1
@@ -1431,9 +1459,12 @@ function rotate_endpoint {
         if [[ -n "$pub" ]]; then
             # Tunnel is up: swap the endpoint live (drop and re-add the peer)
             # instead of restarting, so the route and the fwmark rule never go
-            # away (see the watchdog).
+            # away (see the watchdog). The allowed IPs come from the config: a
+            # bare 0.0.0.0/0 here cut the account's IPv6 until the next restart
+            # (5.1–5.2).
+            aips=$(awk -F'=' '/^AllowedIPs/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$conf")
             wg set "$i" peer "$pub" remove 2>/dev/null
-            wg set "$i" peer "$pub" endpoint "$ep" allowed-ips 0.0.0.0/0 persistent-keepalive 15
+            wg set "$i" peer "$pub" endpoint "$ep" allowed-ips "${aips:-0.0.0.0/0}" persistent-keepalive 15
         fi
         sed -i "s/^Endpoint = .*/Endpoint = ${ep}/" "$conf" || {
             echo -e "  ${C_RED}✖ Error:${C_RST} cannot write $conf"; exit 1; }
