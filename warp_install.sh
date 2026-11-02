@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.3)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.4)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.3"
+SCRIPT_VERSION="5.4"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -33,6 +33,9 @@ MAX_ACCOUNTS=10
 # Marker: IPv6 through WARP is off (installer flag --no-ipv6). Read by the
 # installer only — the interface config changes, so it takes a reinstall.
 NO_IPV6_FILE="${STATE_DIR}/no-ipv6"
+# Packages this installer added to the system, one per line, so that
+# `vps-warp uninstall` can remove exactly them (see install_deps).
+PKG_FILE="${STATE_DIR}/packages"
 
 # Routing knobs. WARP_FWMARK must match what Xray marks its packets with
 # (sockopt.mark), otherwise the ip rule below never matches and traffic
@@ -57,6 +60,38 @@ WARP_MSS6=$((WARP_MTU - 60))
 ROUTES_HELPER="${APP_DIR}/routes.sh"
 DRAIN_DIR="/run/vps-warp"
 MP_SYSCTL_FILE="/etc/sysctl.d/99-vps-warp-multipath.conf"
+
+# Our own nftables table, loaded by every interface's PreUp from NFT_FILE and
+# dropped when the last interface goes down. It holds two things:
+#
+# 1. The TCP MSS clamp on SYNs leaving through the WARP interfaces (MTU 1280).
+#    Up to 5.3 this was an iptables rule in `mangle POSTROUTING`; with the
+#    nf_tables backend iptables created the `mangle` tables for it and never
+#    removed them, and it made iptables a dependency.
+#
+# 2. The Cloudflare client_id. The WARP API gives every device a 3-byte
+#    client_id, and the official client puts it into the three reserved bytes
+#    of every WireGuard message header. Most Cloudflare locations answer
+#    without it, but not all: from Tallinn (TLL) a device that sends zeros
+#    there gets no reply at all, handshake or data, on every endpoint — and
+#    Cloudflare's replies carry the client_id back. Kernel WireGuard always
+#    sends zeros and drops messages whose reserved bytes are not zero, so the
+#    table writes the client_id into the outgoing messages of each account and
+#    zeroes it in the incoming ones. The rules match the account's ListenPort,
+#    which is pinned (see build_conf), so an endpoint rotation never misses
+#    them. Only IPv4: every endpoint of the pool is IPv4, and zeroing the UDP
+#    checksum of an incoming message — needed because the bytes change after
+#    the NIC verified it — is allowed only in IPv4. The outgoing checksum is
+#    left alone: WireGuard sends its packets with the checksum still to be
+#    computed (CHECKSUM_PARTIAL), so the NIC or the kernel computes it over
+#    the bytes as they leave, client_id included.
+NFT_TABLE="vps_warp"
+NFT_FILE="${APP_DIR}/vps-warp.nft"
+# Where the client_id comes from: the device record in the WARP API, the same
+# API wgcf talks to (version and client headers as in wgcf 2.3).
+CF_API="https://api.cloudflareclient.com/v0a5641"
+CF_API_UA="1.1.1.1/6.38.9-5641 (Android 16.0.0)"
+CF_API_CLIENT="a-6.38.9-5641"
 
 # Endpoint pool (TSPU/DPI evasion: what matters is entropy, not the lowest RTT).
 CF_SUBNETS=("188.114.96" "188.114.97")
@@ -148,9 +183,10 @@ function t() {
             "root_req") echo "Требуются права root (sudo)" ;;
             "clean") echo "Очистка старых версий..." ;;
             "clean_ok") echo "Система очищена" ;;
-            "deps") echo "Установка зависимостей (WireGuard, iptables, ping)..." ;;
+            "deps") echo "Установка зависимостей (WireGuard, nftables, ping)..." ;;
             "deps_ok") echo "Зависимости установлены" ;;
             "deps_err") echo "Ошибка установки зависимостей" ;;
+            "no_curl") echo "Нужен curl: им пользуются установщик, watchdog и vps-warp update. Установите curl и повторите" ;;
             "no_pm") echo "Не найден поддерживаемый пакетный менеджер (apt/dnf/yum/zypper/pacman/apk/emerge)" ;;
             "no_systemd") echo "systemd не обнаружен — автозапуск туннеля и watchdog работать не будут (нужен ручной запуск/другой init)" ;;
             "wgcf") echo "Загрузка ядра wgcf..." ;;
@@ -159,6 +195,9 @@ function t() {
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
             "reg_err") echo "Регистрация не удалась: Cloudflare отклонил запросы (rate-limit или блокировка IP хостинга). Попробуйте позже или с другого IP." ;;
+            "cid_ok") echo "client_id устройства:" ;;
+            "cid_err") echo "Не удалось получить client_id у Cloudflare — без него туннель работает не во всех локациях Cloudflare; повторная установка или vps-warp update попробуют снова" ;;
+            "nft_err") echo "nftables не принял таблицу vps-warp, на сервере ничего не изменено:" ;;
             "plus_ask") echo "🔑 Введите ключ WARP+ (или нажмите Enter для бесплатной версии):" ;;
             "plus_keep_hint") echo "(Enter — оставить сохранённый ключ)" ;;
             "plus_apply") echo "Активация WARP+..." ;;
@@ -195,9 +234,10 @@ function t() {
             "root_req") echo "Root privileges required (sudo)" ;;
             "clean") echo "Cleaning up old versions..." ;;
             "clean_ok") echo "System cleaned" ;;
-            "deps") echo "Installing dependencies (WireGuard, iptables, ping)..." ;;
+            "deps") echo "Installing dependencies (WireGuard, nftables, ping)..." ;;
             "deps_ok") echo "Dependencies installed" ;;
             "deps_err") echo "Dependency installation failed" ;;
+            "no_curl") echo "curl is required: the installer, the watchdog and vps-warp update use it. Install curl and retry" ;;
             "no_pm") echo "No supported package manager found (apt/dnf/yum/zypper/pacman/apk/emerge)" ;;
             "no_systemd") echo "systemd not detected — tunnel autostart and watchdog will not work (manual start / other init needed)" ;;
             "wgcf") echo "Downloading wgcf core..." ;;
@@ -206,6 +246,9 @@ function t() {
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
             "reg_err") echo "Registration failed: Cloudflare rejected the requests (rate limit or host IP block). Retry later or from another IP." ;;
+            "cid_ok") echo "Device client_id:" ;;
+            "cid_err") echo "Could not get the client_id from Cloudflare — without it the tunnel works only where Cloudflare does not require it; a reinstall or vps-warp update retries" ;;
+            "nft_err") echo "nftables rejected the vps-warp table, nothing on the server was changed:" ;;
             "plus_ask") echo "🔑 Enter WARP+ key (or press Enter for free tier):" ;;
             "plus_keep_hint") echo "(Enter — keep the saved key)" ;;
             "plus_apply") echo "Activating WARP+..." ;;
@@ -261,48 +304,38 @@ function pkg_name() {
         emerge)  # Gentoo (Portage atoms)
             case "$cmd" in
                 wg-quick) echo "net-vpn/wireguard-tools" ;;
-                iptables) echo "net-firewall/iptables" ;;
+                nft)      echo "net-firewall/nftables" ;;
                 ip)       echo "sys-apps/iproute2" ;;
                 ping)     echo "net-misc/iputils" ;;
-                curl)     echo "net-misc/curl" ;;
-                wget)     echo "net-misc/wget" ;;
             esac ;;
         dnf|yum) # Fedora / RHEL family
             case "$cmd" in
                 wg-quick) echo "wireguard-tools" ;;
-                iptables) echo "iptables" ;;
+                nft)      echo "nftables" ;;
                 ip)       echo "iproute" ;;
                 ping)     echo "iputils" ;;
-                curl)     echo "curl" ;;
-                wget)     echo "wget" ;;
             esac ;;
         pacman|zypper) # Arch/Manjaro, openSUSE (identical names)
             case "$cmd" in
                 wg-quick) echo "wireguard-tools" ;;
-                iptables) echo "iptables" ;;
+                nft)      echo "nftables" ;;
                 ip)       echo "iproute2" ;;
                 ping)     echo "iputils" ;;
-                curl)     echo "curl" ;;
-                wget)     echo "wget" ;;
             esac ;;
         apk)     # Alpine — ping ships in its own package, busybox's lacks -m
             case "$cmd" in
                 wg-quick) echo "wireguard-tools" ;;
-                iptables) echo "iptables" ;;
+                nft)      echo "nftables" ;;
                 ip)       echo "iproute2" ;;
                 ping)     echo "iputils-ping" ;;
-                curl)     echo "curl" ;;
-                wget)     echo "wget" ;;
             esac ;;
         *)       # apt-get (Debian / Ubuntu) — wireguard metapackage keeps the
                  # kernel-module fallback for older kernels, as the original did.
             case "$cmd" in
                 wg-quick) echo "wireguard" ;;
-                iptables) echo "iptables" ;;
+                nft)      echo "nftables" ;;
                 ip)       echo "iproute2" ;;
                 ping)     echo "iputils-ping" ;;
-                curl)     echo "curl" ;;
-                wget)     echo "wget" ;;
             esac ;;
     esac
 }
@@ -325,17 +358,39 @@ function pm_install() {
     esac
 }
 
+# Installed package names, one per line, sorted. Empty for a package manager
+# without a quick listing (Portage): nothing is recorded there, and uninstall
+# leaves its packages alone.
+function pkg_list() {
+    case "$1" in
+        apt-get)        dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 == "ii" { print $2 }' ;;
+        dnf|yum|zypper) rpm -qa --qf '%{NAME}\n' 2>/dev/null ;;
+        pacman)         pacman -Qq 2>/dev/null ;;
+        apk)            apk info 2>/dev/null ;;
+    esac | sort -u
+}
+
 # Verify required commands and install only what is missing.
 #
 # `ping` is a hard requirement, not a nicety: the watchdog's health check IS a
 # ping through the tunnel. Without the binary every check reports failure, so
 # the watchdog rotates the endpoint and restarts wg-quick every 3 minutes
 # forever on an otherwise healthy link.
+#
+# curl is checked, not installed: the documented way to run this script is
+# `bash <(curl …)`, so it is there already; without it the script stops with
+# a clear message instead of pulling it in.
+#
+# Every package that appears between the listings before and after the install
+# — the ones asked for and whatever they pulled in — goes into PKG_FILE, and
+# `vps-warp uninstall` removes exactly those. The file only grows across
+# reinstalls; a package that was already on the system is never in it.
 function install_deps() {
-    local required=(wg-quick ip iptables ping curl wget)
-    local cmd pm pkg
+    local required=(wg-quick ip nft ping)
+    local cmd pm pkg before after added
     local missing_cmds=() missing_pkgs=()
 
+    command -v curl &>/dev/null || fail "$(t "no_curl")"
     for cmd in "${required[@]}"; do
         command -v "$cmd" &>/dev/null || missing_cmds+=("$cmd")
     done
@@ -348,7 +403,17 @@ function install_deps() {
         [[ -n "$pkg" ]] && missing_pkgs+=("$pkg")
     done
 
+    before=$(pkg_list "$pm")
     pm_install "$pm" "${missing_pkgs[@]}" || fail "$(t "deps_err") ($pm)"
+    after=$(pkg_list "$pm")
+    if [[ -n "$before" ]]; then
+        added=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))
+        if [[ -n "$added" ]]; then
+            mkdir -p "$STATE_DIR"
+            { cat "$PKG_FILE" 2>/dev/null; printf '%s\n' "$added"; } | sort -u > "${PKG_FILE}.new" \
+                && mv -f "${PKG_FILE}.new" "$PKG_FILE"
+        fi
+    fi
 
     # Re-verify: a package manager can exit 0 and still not provide the binary
     # (wrong package name on an exotic distro, busybox-only image).
@@ -486,6 +551,59 @@ function reroll_endpoint() {
 function iface_of()    { [[ $1 -eq 1 ]] && echo "$WARP_IFACE"     || echo "${WARP_IFACE}$1"; }
 function wgcf_dir_of() { [[ $1 -eq 1 ]] && echo "$WGCF_DIR"       || echo "${WGCF_DIR}-$1"; }
 function state_of()    { [[ $1 -eq 1 ]] && echo "$WATCHDOG_STATE" || echo "${STATE_DIR}/watchdog-$(iface_of "$1").state"; }
+
+# Remove what the iptables MSS clamp of 5.3 and older leaves behind (see
+# NFT_TABLE at the top), for interfaces 1..max_k (set by the cleanup step, the
+# only caller). Their PostDown deletes the rules, but a hard reboot or
+# a crashed wg-quick can leave copies, so they are deleted until none is left.
+# With the nf_tables backend iptables also created the `mangle` tables for
+# them and never removed them; a table is dropped only when it is exactly that
+# leftover — its one chain is POSTROUTING and it holds no rules.
+function drop_legacy_mss() {
+    local fam j i cmd mss chains
+    for (( j = 1; j <= max_k; j++ )); do
+        i=$(iface_of "$j")
+        for cmd in "iptables $WARP_MSS" "ip6tables $WARP_MSS6"; do
+            mss=${cmd#* }; cmd=${cmd% *}
+            command -v "$cmd" &>/dev/null || continue
+            while "$cmd" -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
+                --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" 2>/dev/null; do :; done
+        done
+    done
+    command -v nft &>/dev/null || return 0
+    for fam in ip ip6; do
+        nft list table "$fam" mangle &>/dev/null || continue
+        chains=$(nft list table "$fam" mangle | awk '$1 == "chain" { print $2 }' | sort -u | tr '\n' ' ')
+        [[ "$chains" == "POSTROUTING " ]] || continue
+        nft list table "$fam" mangle | grep -qvE '^[[:space:]]*(table|chain|type|policy|\}|$)' && continue
+        nft delete table "$fam" mangle 2>/dev/null
+    done
+}
+
+# The client_id of the account in directory $1 (see NFT_TABLE at the top) as
+# six hex digits, or nothing on failure. It belongs to the device and never
+# changes, so it is asked once and kept next to the account as `client_id`;
+# it goes with the account when the account is re-registered. The access token
+# goes to curl through its config on stdin, so it never shows in the process
+# list.
+function client_id_of() {
+    local dir="$1" id tok cid
+    cid=$(cat "$dir/client_id" 2>/dev/null)
+    [[ "$cid" =~ ^[0-9a-f]{6}$ ]] && { echo "$cid"; return 0; }
+    id=$(sed -n "s/^device_id *= *['\"]\(.*\)['\"] *$/\1/p" "$dir/wgcf-account.toml" 2>/dev/null)
+    tok=$(sed -n "s/^access_token *= *['\"]\(.*\)['\"] *$/\1/p" "$dir/wgcf-account.toml" 2>/dev/null)
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ && "$tok" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    cid=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+        | curl -fsS -m 15 -K - -H "User-Agent: ${CF_API_UA}" -H "CF-Client-Version: ${CF_API_CLIENT}" \
+            "${CF_API}/reg/${id}" 2>/dev/null \
+        | grep -oE '"client_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]+"' | head -1 \
+        | sed -E 's|.*"([A-Za-z0-9+/=]+)"$|\1|' \
+        | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [[ "$cid" =~ ^[0-9a-f]{6}$ ]] || return 1
+    printf '%s\n' "$cid" > "$dir/client_id"
+    chmod 600 "$dir/client_id"
+    echo "$cid"
+}
 
 # --- Pre-flight Checks ---
 [[ $EUID -ne 0 ]] && fail "$(t "root_req")"
@@ -634,6 +752,21 @@ done
 cd "$WGCF_DIR" || fail "Cannot enter $WGCF_DIR"
 done_ "$(t "reg_ok")$([[ $ACCOUNTS -gt 1 ]] && echo " (${ACCOUNTS})")"
 
+# client_id of every account (see NFT_TABLE at the top). Without it the account
+# still works wherever Cloudflare does not ask for it, so a failure is a warning.
+CLIENT_IDS=()
+for (( k = 1; k <= ACCOUNTS; k++ )); do
+    tag=""
+    [[ $ACCOUNTS -gt 1 ]] && tag="$(iface_of "$k"): "
+    if cid=$(client_id_of "$(wgcf_dir_of "$k")"); then
+        done_ "$(t "cid_ok") ${tag}${cid}"
+    else
+        cid=""
+        warn "$(t "cid_err")${tag:+ (${tag%: })}"
+    fi
+    CLIENT_IDS+=("$cid")
+done
+
 # 5. WARP+
 # Reuse a previously saved license (if PERSIST_LICENSE=1) so WARP+ survives an
 # update re-run without re-entry.
@@ -677,11 +810,13 @@ step "🛠️  $(t "opt")"
 # interface that a multipath route points at makes the kernel drop the whole
 # route, the other accounts' share included. PreDown rebuilds the route without
 # this interface first. When the last interface goes down the helper removes
-# the fwmark rule, as PostDown did in earlier versions.
+# the fwmark rule, as PostDown did in earlier versions, and our nftables table.
 #
-# The MSS clamp deletes its own rule before adding it. Without that, a hard
-# reboot or an OOM-killed wg-quick leaves the rule behind and the next start
-# stacks a duplicate; after a few crash cycles the mangle chain holds N copies.
+# PreUp loads the nftables table (MSS clamp and client_id, see NFT_TABLE at the
+# top) from NFT_FILE before the interface exists, so the very first handshake
+# already carries the client_id. The file replaces the whole table in one
+# transaction, so loading it again — every interface does, and a hard reboot
+# or a crashed wg-quick may have left the table behind — never stacks rules.
 #
 # Local port and endpoint. The outer tuple decides which Cloudflare machine the
 # account egresses from, i.e. the exit address and country (see the note above
@@ -717,18 +852,10 @@ function build_conf() {
     sed -i "/^\[Interface\]/a\\
 MTU = ${WARP_MTU}\\
 Table = off\\
+PreUp = nft -f ${NFT_FILE} || true\\
 PostUp = ${ROUTES_HELPER} || true\\
 PreDown = ${ROUTES_HELPER} --without ${iface} || true\\
-PostUp = iptables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS} 2>/dev/null || true\\
-PostUp = iptables -t mangle -A POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS} || true\\
-PostDown = iptables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS} 2>/dev/null || true\\
 " "$conf"
-    if [[ $USE_IPV6 -eq 1 ]]; then
-        sed -i "/^PostDown = iptables /a\\
-PostUp = ip6tables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} 2>/dev/null || true\\
-PostUp = ip6tables -t mangle -A POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} || true\\
-PostDown = ip6tables -t mangle -D POSTROUTING -o ${iface} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${WARP_MSS6} 2>/dev/null || true" "$conf"
-    fi
 
     # Inject Keepalive into [Peer]
     sed -i '/^\[Peer\]/a\
@@ -753,6 +880,40 @@ PersistentKeepalive = 15\
     fi
 }
 for (( k = 1; k <= ACCOUNTS; k++ )); do build_conf "$k"; done
+
+# The nftables table (see NFT_TABLE at the top), as loaded by every PreUp.
+# `table` + `delete table` + the definition replace it in one transaction,
+# whether it existed or not. Priorities are numbers (-150 = mangle, -300 = raw)
+# for older nft that lacks the names. The MSS rule only lowers the value, as
+# iptables' TCPMSS --set-mss did. Validated here, before the cleanup step
+# touches the running setup, and written to NFT_FILE after it.
+ifset=$(printf '"%s", ' "${IFACES[@]}")
+ifset="{ ${ifset%, } }"
+NFT_TEXT=$(
+    echo "# Generated by the vps-warp installer — edits are lost on update."
+    echo "table inet ${NFT_TABLE}"
+    echo "delete table inet ${NFT_TABLE}"
+    echo "table inet ${NFT_TABLE} {"
+    echo "    chain postrouting {"
+    echo "        type filter hook postrouting priority -150; policy accept;"
+    echo "        meta nfproto ipv4 oifname ${ifset} tcp flags & (syn | rst) == syn tcp option maxseg size > ${WARP_MSS} tcp option maxseg size set ${WARP_MSS}"
+    [[ $USE_IPV6 -eq 1 ]] && echo "        meta nfproto ipv6 oifname ${ifset} tcp flags & (syn | rst) == syn tcp option maxseg size > ${WARP_MSS6} tcp option maxseg size set ${WARP_MSS6}"
+    for (( k = 1; k <= ACCOUNTS; k++ )); do
+        [[ -n "${CLIENT_IDS[k-1]}" ]] && echo "        meta nfproto ipv4 udp sport ${USED_PORTS[k-1]} @th,72,24 set 0x${CLIENT_IDS[k-1]}"
+    done
+    echo "    }"
+    echo "    chain prerouting {"
+    echo "        type filter hook prerouting priority -300; policy accept;"
+    for (( k = 1; k <= ACCOUNTS; k++ )); do
+        [[ -n "${CLIENT_IDS[k-1]}" ]] && echo "        meta nfproto ipv4 udp dport ${USED_PORTS[k-1]} @th,72,24 set 0 udp checksum set 0"
+    done
+    echo "    }"
+    echo "}"
+)
+nft_check=$(mktemp) || fail "mktemp failed"
+printf '%s\n' "$NFT_TEXT" > "$nft_check"
+nft_err=$(nft -c -f "$nft_check" 2>&1) || { rm -f "$nft_check"; fail "$(t "nft_err") ${nft_err}"; }
+rm -f "$nft_check"
 
 # Must happen before the interfaces come up: `default` is the template new
 # interfaces inherit from, so they pick up the relaxed value at creation.
@@ -780,6 +941,7 @@ done
 systemctl disable warp-watchdog.timer --now &>/dev/null || true
 rm -rf /opt/warp-native /opt/vps-warp /etc/cron.d/warp-native /usr/local/bin/warp /etc/systemd/system/warp-watchdog.* "$DRAIN_DIR" &>/dev/null
 systemctl daemon-reload
+drop_legacy_mss
 done_ "$(t "clean_ok")"
 
 # Routes helper (see ROUTES_HELPER at the top). Written before any interface
@@ -796,12 +958,14 @@ chmod 700 "$APP_DIR" # Security: blocks local privilege escalation via the scrip
     printf 'TABLE=%q\n'     "$WARP_TABLE"
     printf 'DRAIN_DIR=%q\n' "$DRAIN_DIR"
     printf 'IPV6=%q\n'      "$USE_IPV6"
+    printf 'NFT_TABLE=%q\n' "$NFT_TABLE"
 } > "$ROUTES_HELPER"
 
 cat >> "$ROUTES_HELPER" << 'RTEOF'
 # Point the default route of $TABLE at the WARP interfaces that are up and not
 # drained by the watchdog, and keep the fwmark rule while there is at least one
 # of them. `--without IFACE` leaves that interface out (it runs from PreDown).
+# When none is left, our nftables table goes too (each PreUp loads it again).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 without=""
 [[ "$1" == "--without" ]] && without="$2"
@@ -834,6 +998,7 @@ if [[ ${#live[@]} -eq 0 ]]; then
         ip -6 route flush table "$TABLE" 2>/dev/null
         while rule_present -6; do ip -6 rule del fwmark "$FWMARK" table "$TABLE" 2>/dev/null || break; done
     fi
+    nft delete table inet "$NFT_TABLE" 2>/dev/null
     exit 0
 fi
 
@@ -860,6 +1025,10 @@ fi
 exit 0
 RTEOF
 chmod 700 "$ROUTES_HELPER"
+
+# The nftables table every PreUp loads (validated before the cleanup step).
+printf '%s\n' "$NFT_TEXT" > "$NFT_FILE"
+chmod 600 "$NFT_FILE"
 
 # With several accounts the kernel has to hash on ports as well: by addresses
 # alone every connection to one destination would land on the same account.
@@ -1290,6 +1459,8 @@ done_ "$(t "watchdog_ok")"
     printf 'DRAIN_DIR=%q\n'      "$DRAIN_DIR"
     printf 'RP_SYSCTL_FILE=%q\n' "$RP_SYSCTL_FILE"
     printf 'MP_SYSCTL_FILE=%q\n' "$MP_SYSCTL_FILE"
+    printf 'NFT_TABLE=%q\n'      "$NFT_TABLE"
+    printf 'PKG_FILE=%q\n'       "$PKG_FILE"
 } > /usr/local/bin/vps-warp
 
 cat >> /usr/local/bin/vps-warp << 'CLIEOF'
@@ -1478,9 +1649,57 @@ function rotate_endpoint {
     show_status
 }
 
+# Installed package names, one per line, sorted (same as the installer's).
+pkg_list() {
+    if   command -v dpkg-query &>/dev/null; then dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 == "ii" { print $2 }'
+    elif command -v rpm        &>/dev/null; then rpm -qa --qf '%{NAME}\n' 2>/dev/null
+    elif command -v pacman     &>/dev/null; then pacman -Qq 2>/dev/null
+    elif command -v apk        &>/dev/null; then apk info 2>/dev/null
+    fi | sort -u
+}
+
+# Remove the packages the installer added (PKG_FILE) and nothing else. They
+# stay when another WireGuard tunnel still uses the tools, when nftables.service
+# is enabled (then nftables is someone's firewall), or when the package manager
+# would take more than them — something installed later depends on them.
+# Sets PKG_MSG, the line uninstall prints about it.
+remove_packages() {
+    local pkgs=() extra rc=1
+    [[ -s "$PKG_FILE" ]] && mapfile -t pkgs < <(comm -12 <(grep -E '^[A-Za-z0-9][A-Za-z0-9.+_-]*$' "$PKG_FILE" | sort -u) <(pkg_list))
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        PKG_MSG="No packages to remove: the installer added none (it records them since v5.4)"; return
+    fi
+    if [[ -n "$(wg show interfaces 2>/dev/null)" ]] || compgen -G '/etc/wireguard/*.conf' >/dev/null; then
+        PKG_MSG="Packages left installed — another WireGuard tunnel uses them: ${pkgs[*]}"; return
+    fi
+    if printf '%s\n' "${pkgs[@]}" | grep -qx nftables && [[ "$(systemctl is-enabled nftables 2>/dev/null)" == "enabled" ]]; then
+        PKG_MSG="Packages left installed — nftables.service is enabled: ${pkgs[*]}"; return
+    fi
+    if command -v apt-get &>/dev/null; then
+        extra=$(apt-get -s purge "${pkgs[@]}" 2>/dev/null \
+            | awk '$1 == "Purg" || $1 == "Remv" { sub(/:.*/, "", $2); print $2 }' \
+            | grep -vxF -f <(printf '%s\n' "${pkgs[@]}"))
+        if [[ -n "$extra" ]]; then
+            PKG_MSG="Packages left installed — removing them would also remove $(echo $extra): ${pkgs[*]}"; return
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${pkgs[@]}" &>/dev/null; rc=$?
+    elif command -v rpm &>/dev/null; then
+        rpm -e --test "${pkgs[@]}" &>/dev/null && { rpm -e "${pkgs[@]}" &>/dev/null; rc=$?; }
+    elif command -v pacman &>/dev/null; then
+        pacman -R --noconfirm "${pkgs[@]}" &>/dev/null; rc=$?   # refuses to break dependencies
+    elif command -v apk &>/dev/null; then
+        apk del "${pkgs[@]}" &>/dev/null; rc=$?                 # keeps what others depend on
+    fi
+    if [[ $rc -eq 0 ]]; then
+        PKG_MSG="Removed the packages the installer added: ${pkgs[*]}"
+    else
+        PKG_MSG="Packages left installed — the package manager would not remove them alone: ${pkgs[*]}"
+    fi
+}
+
 function uninstall_self {
-    local i
-    echo -e "\n  ${C_YLW}⚠${C_RST} This removes the tunnel, watchdog, CLI and all VPS-WARP state."
+    local i fam cmd mss chains
+    echo -e "\n  ${C_YLW}⚠${C_RST} This removes the tunnel, watchdog, CLI, all VPS-WARP state and the packages the installer added."
     read -r -p "  Type 'yes' to confirm: " reply
     [[ "$reply" == "yes" ]] || { echo -e "  ${C_GRY}Aborted.${C_RST}\n"; exit 0; }
 
@@ -1490,20 +1709,34 @@ function uninstall_self {
     systemctl daemon-reload
 
     # Belt and braces: if an interface ever died without its hooks running, the
-    # ip rule, the route and the mangle clamp survive and quietly misroute later
-    # traffic.
+    # ip rule, the route and the nftables table survive and quietly misroute
+    # later traffic. Also cleared: what the iptables MSS clamp of 5.3 and older
+    # may have left — its rules, and its `mangle` tables when they hold nothing
+    # but an empty POSTROUTING chain.
     while ip rule del fwmark "$FWMARK" table "$WTABLE" 2>/dev/null; do :; done
     ip route flush table "$WTABLE" 2>/dev/null
     while ip -6 rule del fwmark "$FWMARK" table "$WTABLE" 2>/dev/null; do :; done
     ip -6 route flush table "$WTABLE" 2>/dev/null
+    nft delete table inet "$NFT_TABLE" 2>/dev/null
     for i in "${IFACES[@]}"; do
-        iptables -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
-            --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WMSS" 2>/dev/null
-        ip6tables -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
-            --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WMSS6" 2>/dev/null
+        for cmd in "iptables $WMSS" "ip6tables $WMSS6"; do
+            mss=${cmd#* }; cmd=${cmd% *}
+            command -v "$cmd" &>/dev/null || continue
+            while "$cmd" -t mangle -D POSTROUTING -o "$i" -p tcp -m tcp \
+                --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss" 2>/dev/null; do :; done
+        done
         ip link del "$i" 2>/dev/null
         rm -f "/etc/wireguard/${i}.conf"
     done
+    if command -v nft &>/dev/null; then
+        for fam in ip ip6; do
+            nft list table "$fam" mangle &>/dev/null || continue
+            chains=$(nft list table "$fam" mangle | awk '$1 == "chain" { print $2 }' | sort -u | tr '\n' ' ')
+            [[ "$chains" == "POSTROUTING " ]] || continue
+            nft list table "$fam" mangle | grep -qvE '^[[:space:]]*(table|chain|type|policy|\}|$)' && continue
+            nft delete table "$fam" mangle 2>/dev/null
+        done
+    fi
 
     rm -f "$RP_SYSCTL_FILE"
     if [[ -f "$MP_SYSCTL_FILE" ]]; then
@@ -1511,9 +1744,11 @@ function uninstall_self {
         sysctl -qw net.ipv4.fib_multipath_hash_policy=0
     fi
     sysctl --system &>/dev/null
+    remove_packages
     rm -rf "$APP_DIR" "$STATE_DIR" "$DRAIN_DIR" "${DRAIN_DIR}.lock"
     rm -f /usr/local/bin/wgcf
-    echo -e "  ${C_GRN}✔${C_RST} VPS-WARP removed. The wireguard package was left installed.\n"
+    echo -e "  ${C_GRN}✔${C_RST} VPS-WARP removed."
+    echo -e "  ${C_GRY}${PKG_MSG}${C_RST}\n"
     rm -f /usr/local/bin/vps-warp
 }
 
