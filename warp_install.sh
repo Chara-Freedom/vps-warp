@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.4.1)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.5)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.4.1"
+SCRIPT_VERSION="5.5"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -60,6 +60,19 @@ WARP_MSS6=$((WARP_MTU - 60))
 ROUTES_HELPER="${APP_DIR}/routes.sh"
 DRAIN_DIR="/run/vps-warp"
 MP_SYSCTL_FILE="/etc/sysctl.d/99-vps-warp-multipath.conf"
+
+# The accounts' ListenPorts are reserved in the kernel
+# (net.ipv4.ip_local_reserved_ports), so that no outgoing connection is ever
+# given one as its local port. The kernel hands out ports from
+# net.ipv4.ip_local_port_range (32768–60999 by default) to outgoing sockets;
+# when an account's port lies in that range, such a socket can hold it at the
+# moment the interface binds it — at install or at any restart — and the
+# interface fails with "Address already in use" (5.4.1 on a busy exit, a new
+# account's port). PORTS_FILE lists the ports we added, so that a later run or
+# `vps-warp uninstall` takes back exactly ours: the kernel value is shared with
+# other software, and its reservations stay.
+PORTS_SYSCTL_FILE="/etc/sysctl.d/99-vps-warp-ports.conf"
+PORTS_FILE="${STATE_DIR}/reserved-ports"
 
 # Our own nftables table, loaded by every interface's PreUp from NFT_FILE and
 # dropped when the last interface goes down. It holds two things:
@@ -210,6 +223,10 @@ function t() {
             "start") echo "Запуск туннеля..." ;;
             "start_ok") echo "Интерфейс поднят" ;;
             "start_err") echo "Не удалось поднять интерфейс. Смотрите: journalctl -u" ;;
+            "start_some_err") echo "Не поднялись:" ;;
+            "start_some_hint") echo "Остальное установлено, watchdog будет перезапускать их сам; причина — journalctl -u wg-quick@<имя>" ;;
+            "ports_ok") echo "Порты аккаунтов зарезервированы в ядре, исходящие соединения их не займут:" ;;
+            "ports_warn") echo "Не удалось зарезервировать порты аккаунтов в ядре (net.ipv4.ip_local_reserved_ports); новые порты выбраны ниже диапазона исходящих" ;;
             "handshake") echo "Ожидание ответа сети (Handshake)..." ;;
             "hs_ok") echo "Соединение установлено! Задержка:" ;;
             "geo") echo "Проверка страны выхода WARP..." ;;
@@ -261,6 +278,10 @@ function t() {
             "start") echo "Starting tunnel..." ;;
             "start_ok") echo "Interface is up" ;;
             "start_err") echo "Interface failed to come up. See: journalctl -u" ;;
+            "start_some_err") echo "Failed to come up:" ;;
+            "start_some_hint") echo "Everything else is installed, and the watchdog will keep restarting them; the reason: journalctl -u wg-quick@<name>" ;;
+            "ports_ok") echo "Account ports reserved in the kernel, outgoing connections won't take them:" ;;
+            "ports_warn") echo "Could not reserve the account ports in the kernel (net.ipv4.ip_local_reserved_ports); new ports are picked below the outgoing range" ;;
             "handshake") echo "Waiting for network handshake..." ;;
             "hs_ok") echo "Connection established! Latency:" ;;
             "geo") echo "Checking WARP egress country..." ;;
@@ -499,17 +520,54 @@ function cf_country() {
         | awk -F= '$1 == "loc" { print $2; exit }'
 }
 
-# A random UDP port in 20000–49999 that nothing is bound to. `ss` may be
-# missing on minimal images; a collision there is unlikely, and wg-quick would
-# fail loudly rather than silently.
+# A random UDP port for a new account: from 20000 up to just below the range
+# the kernel gives to outgoing connections (see PORTS_SYSCTL_FILE), so it does
+# not depend on the reservation alone — that one may be impossible in a
+# container. Checked against every UDP socket, connected ones included: `ss -l`
+# lists only the unconnected, and an outgoing UDP socket is connected. `ss` may
+# be missing on minimal images; then the reservation keeps the port free. With
+# an unusual local port range that leaves less than 1000 ports below it, the
+# old 20000–49999 is used.
 function random_free_port() {
-    local p
+    local p lo=20000 hi=49999 eph
+    eph=$(awk '{ print $1 }' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null)
+    if [[ "$eph" =~ ^[0-9]+$ ]] && (( eph - 1 < hi && eph - 1 - lo >= 1000 )); then
+        hi=$(( eph - 1 ))
+    fi
     for _ in {1..20}; do
-        p=$(( 20000 + RANDOM % 30000 ))
-        command -v ss &>/dev/null && ss -Hlun "sport = :$p" 2>/dev/null | grep -q . && continue
+        p=$(( lo + RANDOM % (hi - lo + 1) ))
+        command -v ss &>/dev/null && ss -Hanu "sport = :$p" 2>/dev/null | grep -q . && continue
         break
     done
     echo "$p"
+}
+
+# Reserve the given ports (the accounts' ListenPorts) in the kernel and keep
+# them reserved across reboots (see PORTS_SYSCTL_FILE). Ports we added before
+# (PORTS_FILE) are taken out first, so an account that is gone frees its port;
+# everything else in the shared value stays. With no arguments it only takes
+# ours out. Returns 1 where the setting is read-only (some containers).
+function reserve_ports() {
+    local key=/proc/sys/net/ipv4/ip_local_reserved_ports tok val old=() keep=()
+    [[ -w "$key" ]] || return 1
+    mapfile -t old < <(grep -E '^[0-9]+$' "$PORTS_FILE" 2>/dev/null)
+    for tok in $(tr ',' ' ' < "$key"); do
+        [[ " ${old[*]} " == *" ${tok} "* ]] || keep+=("$tok")
+    done
+    val=$(printf '%s\n' "${keep[@]}" "$@" | grep . | sort -u | paste -sd, -)
+    printf '%s\n' "$val" > "$key" 2>/dev/null || return 1
+    mkdir -p "$STATE_DIR"
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "$@" > "$PORTS_FILE"
+        {
+            echo "# Added by vps-warp: the WARP accounts' ports, kept out of the local ports"
+            echo "# the kernel gives to outgoing connections. Removed by 'vps-warp uninstall'."
+            echo "net.ipv4.ip_local_reserved_ports = ${val}"
+        } > "$PORTS_SYSCTL_FILE"
+        chmod 644 "$PORTS_SYSCTL_FILE"
+    else
+        rm -f "$PORTS_FILE" "$PORTS_SYSCTL_FILE"
+    fi
 }
 
 # A random endpoint from the pool. $RANDOM instead of shuf: minimal/busybox
@@ -880,6 +938,12 @@ PersistentKeepalive = 15\
     fi
 }
 for (( k = 1; k <= ACCOUNTS; k++ )); do build_conf "$k"; done
+# Right after the pick: from here on the kernel gives these ports to nobody.
+if reserve_ports "${USED_PORTS[@]}"; then
+    done_ "$(t "ports_ok") ${USED_PORTS[*]}"
+else
+    warn "$(t "ports_warn")"
+fi
 
 # The nftables table (see NFT_TABLE at the top), as loaded by every PreUp.
 # `table` + `delete table` + the definition replace it in one transaction,
@@ -1071,18 +1135,29 @@ done
 WARP_LOCAL_IP=$(grep -oP '(?<=Address = )[0-9.]+' "/etc/wireguard/${WARP_IFACE}.conf" | head -1)
 
 # 7. Start Services
+# An interface that fails to come up does not stop the run. The cleanup step
+# has removed the watchdog by now, and stopping here (5.4.1) left the box with
+# the other tunnels up and nothing watching them. The run goes on without the
+# failed interfaces — the handshake and country checks skip them rather than
+# blame the network for a config error — installs the watchdog, which keeps
+# restarting them like any tunnel that is down, and ends with an error naming
+# them.
 step "🚀 $(t "start")"
+START_FAILED=()
 for iface in "${IFACES[@]}"; do
     systemctl enable "wg-quick@${iface}" &>/dev/null
-    # Previously this failure was swallowed and the run continued into the
-    # handshake loop, which then blamed the network for a config error.
-    systemctl restart "wg-quick@${iface}" &>/dev/null || fail "$(t "start_err") wg-quick@${iface}"
+    if ! systemctl restart "wg-quick@${iface}" &>/dev/null; then
+        warn "$(t "start_err") wg-quick@${iface}"
+        START_FAILED+=("$iface")
+    fi
 done
-done_ "$(t "start_ok")"
+[[ ${#START_FAILED[@]} -eq 0 ]] && done_ "$(t "start_ok")"
+function start_failed() { [[ " ${START_FAILED[*]} " == *" $1 "* ]]; }
 
 # 8. Handshake Check
 step "📡 $(t "handshake")"
 for iface in "${IFACES[@]}"; do
+    start_failed "$iface" && continue
     hs_ok=0
     for _ in {1..15}; do
         hs_ts=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
@@ -1104,6 +1179,7 @@ if [[ -f "$EGRESS_OFF_FILE" ]]; then
 else
     SERVER_CC=$(cf_country)
     for iface in "${IFACES[@]}"; do
+        start_failed "$iface" && continue
         tag=""
         [[ $ACCOUNTS -gt 1 ]] && tag=" (${iface})"
         WARP_CC=$(cf_country --interface "$iface")
@@ -1263,8 +1339,14 @@ check_iface() {
     local exp backoff try got dst rot
     [[ ${#IFACES[@]} -gt 1 ]] && P="WARP Watchdog [${IFACE}]"
 
-    # Silent by design when the operator stopped the tunnel on purpose.
-    systemctl is-active --quiet "wg-quick@${IFACE}" || return 0
+    # Silent by design when the operator stopped the tunnel on purpose. A unit
+    # that FAILED to come up is another matter — its port was taken, say — and
+    # is handled below like any tunnel that is down. Up to 5.4.1 it was skipped
+    # as well, so an interface that failed at install or at boot stayed down
+    # until a human came.
+    if ! systemctl is-active --quiet "wg-quick@${IFACE}"; then
+        systemctl is-failed --quiet "wg-quick@${IFACE}" || return 0
+    fi
     [[ -f "$CONF" ]] || { echo "${P}: $CONF missing, nothing to do"; return 0; }
 
     # Default to 0 *before* the arithmetic. `wg show` prints nothing when the
@@ -1476,6 +1558,8 @@ done_ "$(t "watchdog_ok")"
     printf 'DRAIN_DIR=%q\n'      "$DRAIN_DIR"
     printf 'RP_SYSCTL_FILE=%q\n' "$RP_SYSCTL_FILE"
     printf 'MP_SYSCTL_FILE=%q\n' "$MP_SYSCTL_FILE"
+    printf 'PORTS_SYSCTL_FILE=%q\n' "$PORTS_SYSCTL_FILE"
+    printf 'PORTS_FILE=%q\n'     "$PORTS_FILE"
     printf 'NFT_TABLE=%q\n'      "$NFT_TABLE"
     printf 'PKG_FILE=%q\n'       "$PKG_FILE"
 } > /usr/local/bin/vps-warp
@@ -1714,6 +1798,19 @@ remove_packages() {
     fi
 }
 
+# Take our ports back out of net.ipv4.ip_local_reserved_ports (the installer's
+# reserve_ports); reservations made by other software stay.
+function release_ports {
+    local key=/proc/sys/net/ipv4/ip_local_reserved_ports tok old=() keep=()
+    rm -f "$PORTS_SYSCTL_FILE"
+    [[ -w "$key" && -f "$PORTS_FILE" ]] || return 0
+    mapfile -t old < <(grep -E '^[0-9]+$' "$PORTS_FILE")
+    for tok in $(tr ',' ' ' < "$key"); do
+        [[ " ${old[*]} " == *" ${tok} "* ]] || keep+=("$tok")
+    done
+    printf '%s\n' "$(IFS=,; echo "${keep[*]}")" > "$key" 2>/dev/null
+}
+
 function uninstall_self {
     local i fam cmd mss chains
     echo -e "\n  ${C_YLW}⚠${C_RST} This removes the tunnel, watchdog, CLI, all VPS-WARP state and the packages the installer added."
@@ -1760,6 +1857,7 @@ function uninstall_self {
         rm -f "$MP_SYSCTL_FILE"
         sysctl -qw net.ipv4.fib_multipath_hash_policy=0
     fi
+    release_ports
     sysctl --system &>/dev/null
     remove_packages
     rm -rf "$APP_DIR" "$STATE_DIR" "$DRAIN_DIR" "${DRAIN_DIR}.lock"
@@ -1825,6 +1923,10 @@ chmod 755 /usr/local/bin/vps-warp
 mkdir -p "$STATE_DIR"
 printf '%s\n' "$SCRIPT_VERSION" > "$VERSION_FILE"
 printf '%s\n' "$ACCOUNTS" > "$ACCOUNTS_FILE"
+
+# Everything is installed, the watchdog included; the interfaces that did not
+# come up (step 7) are left to it, and the run still reports the failure.
+[[ ${#START_FAILED[@]} -gt 0 ]] && fail "$(t "start_some_err") ${START_FAILED[*]}. $(t "start_some_hint")"
 
 # Finish
 echo -e "\n  🎉 ${C_GRN}${C_BLD}$(t "finish")${C_RST}"
