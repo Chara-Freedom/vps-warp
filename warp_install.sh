@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.5)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.6)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.5"
+SCRIPT_VERSION="5.6"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -27,9 +27,11 @@ WATCHDOG_STATE="${STATE_DIR}/watchdog.state"
 # hand takes effect without a reinstall.
 EGRESS_OFF_FILE="${STATE_DIR}/no-egress-check"
 # Number of WARP accounts (installer flag --accounts N). Kept here because
-# `vps-warp update` re-runs this script with no arguments.
+# `vps-warp update` re-runs this script with no arguments. There is no upper
+# bound (since 5.6): the 10 of 5.0–5.5 had no measurement behind it, and a
+# loaded server can need more — see the note on measurements in the
+# watchdog for what grows with the number.
 ACCOUNTS_FILE="${STATE_DIR}/accounts"
-MAX_ACCOUNTS=10
 # Marker: IPv6 through WARP is off (installer flag --no-ipv6). Read by the
 # installer only — the interface config changes, so it takes a reinstall.
 NO_IPV6_FILE="${STATE_DIR}/no-ipv6"
@@ -207,6 +209,7 @@ function t() {
             "wgcf_resolve_err") echo "Не удалось узнать последнюю версию wgcf: GitHub не ответил. Текущая установка WARP не тронута, попробуйте позже." ;;
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
+            "reg_wait") echo "Cloudflare отклонил регистрацию (ограничение частоты), повтор через" ;;
             "reg_err") echo "Регистрация не удалась: Cloudflare отклонил запросы (rate-limit или блокировка IP хостинга). Попробуйте позже или с другого IP." ;;
             "cid_ok") echo "client_id устройства:" ;;
             "cid_err") echo "Не удалось получить client_id у Cloudflare — без него туннель работает не во всех локациях Cloudflare; повторная установка или vps-warp update попробуют снова" ;;
@@ -262,6 +265,7 @@ function t() {
             "wgcf_resolve_err") echo "Could not resolve the latest wgcf version: GitHub did not answer. The current WARP setup is untouched; retry later." ;;
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
+            "reg_wait") echo "Cloudflare refused the registration (rate limit), retrying in" ;;
             "reg_err") echo "Registration failed: Cloudflare rejected the requests (rate limit or host IP block). Retry later or from another IP." ;;
             "cid_ok") echo "Device client_id:" ;;
             "cid_err") echo "Could not get the client_id from Cloudflare — without it the tunnel works only where Cloudflare does not require it; a reinstall or vps-warp update retries" ;;
@@ -675,9 +679,9 @@ function client_id_of() {
 # WARP chained into WARP, mostly on Russian hosts) — the check would keep
 # re-rolling it away — and for those where a mismatch simply does not matter.
 #
-# --accounts N (1–$MAX_ACCOUNTS) sets how many WARP accounts share the traffic;
-# without it the previous number stands (1 on a first install). Both flags are
-# validated before anything on the box changes.
+# --accounts N (1 or more, no upper bound) sets how many WARP accounts share
+# the traffic; without it the previous number stands (1 on a first install).
+# Both flags are validated before anything on the box changes.
 #
 # --no-ipv6 keeps WARP IPv4-only, as every version before 5.1 did; --ipv6 turns
 # IPv6 back on. Without either, the previous choice stands (on by default).
@@ -695,12 +699,14 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+# A positive whole number without leading zeros: bash arithmetic reads "010"
+# as octal and "08" as an error.
 if [[ $ACCOUNTS_SET -eq 1 ]]; then
-    [[ "$ACCOUNTS_ARG" =~ ^[0-9]+$ && "$ACCOUNTS_ARG" -ge 1 && "$ACCOUNTS_ARG" -le $MAX_ACCOUNTS ]] \
-        || fail "--accounts takes a number from 1 to ${MAX_ACCOUNTS}, got '${ACCOUNTS_ARG}'"
+    [[ "$ACCOUNTS_ARG" =~ ^[1-9][0-9]*$ ]] \
+        || fail "--accounts takes a whole number from 1 up, got '${ACCOUNTS_ARG}'"
 fi
 OLD_ACCOUNTS=$(cat "$ACCOUNTS_FILE" 2>/dev/null)
-[[ "$OLD_ACCOUNTS" =~ ^[0-9]+$ && "$OLD_ACCOUNTS" -ge 1 && "$OLD_ACCOUNTS" -le $MAX_ACCOUNTS ]] || OLD_ACCOUNTS=1
+[[ "$OLD_ACCOUNTS" =~ ^[1-9][0-9]*$ ]] || OLD_ACCOUNTS=1
 ACCOUNTS=${ACCOUNTS_ARG:-$OLD_ACCOUNTS}
 IFACES=()
 for (( k = 1; k <= ACCOUNTS; k++ )); do IFACES+=("$(iface_of "$k")"); done
@@ -782,6 +788,14 @@ done_ "$(t "wgcf_ok") (v${WGCF_VERSION#v})"
 # One working directory per account; an account that already exists is reused,
 # so a reinstall or `vps-warp update` keeps every account it had. New accounts
 # are registered a few seconds apart: Cloudflare rate-limits registrations.
+# The limit is a short window, not a block: on a test server Cloudflare took
+# seven registrations in a row 5 s apart, refused the eighth three times within
+# ten seconds, and took it a minute later. So a refused registration is retried
+# after growing pauses (3, 15, 30, 60 s) before the run gives up. Up to 5.5 it
+# was tried three times 3 s apart, which was enough only while ten accounts
+# were the most. A run that gives up has changed nothing on the box yet, and
+# the accounts it did register are kept for the next run.
+REG_WAITS=(3 15 30 60)
 step "🛡️  $(t "reg")"
 mkdir -p "$WGCF_DIR"
 chmod 700 "$STATE_DIR" "$WGCF_DIR"
@@ -795,9 +809,11 @@ for (( k = 1; k <= ACCOUNTS; k++ )); do
     cd "$dir" || fail "Cannot enter $dir"
     if [[ ! -f wgcf-account.toml ]]; then
         [[ $registered -gt 0 ]] && sleep 5
-        for _ in {1..3}; do
+        for w in "${REG_WAITS[@]}" 0; do
             timeout 40 bash -c 'yes | wgcf register' &>/dev/null && break
-            sleep 3
+            [[ $w -gt 0 ]] || break
+            [[ $w -ge 15 ]] && warn "$(t "reg_wait") ${w}s ($(iface_of "$k"))"
+            sleep "$w"
         done
         registered=$(( registered + 1 ))
     fi
@@ -1298,12 +1314,57 @@ probe_fails() {
     echo "$fails"
 }
 
-declare -A PROBE=() SLOW=()
+# --- Measurements: every account at the same time ---
+# Every network check of a run — the test connections above, the ping and the
+# egress country below — goes through the account's own interface and depends
+# on nothing but that account. So all accounts are measured at once, and only
+# the verdicts are taken one account after another: a run lasts as long as its
+# slowest account instead of the sum of all of them. Up to 5.5 the accounts
+# went one by one — on a loaded server with four accounts, all at the limit, a
+# run took 44–81 s, and each account adds up to 40 s of test connections alone,
+# so with many accounts a run would outgrow the 3-minute timer and a dead
+# account would wait its turn. Measured in the same seconds, the accounts are
+# also compared under the same conditions, which the relative verdict assumes.
+# The server's own country is asked once per run, not once per account. Only
+# the re-rolls after a wrong country (rare) still go one account at a time.
+RUN_DIR=$(mktemp -d /run/vps-warp-watchdog.XXXXXX) || exit 1
+trap 'rm -rf "$RUN_DIR"' EXIT
+
+# One line per account: ping (1 or 0), egress country (- when not asked or
+# unknown), failed test connections (- when not probed). Test connections only
+# with several accounts and only on a tunnel that is up, as before.
+measure() {   # iface
+    local dst ping_ok=0 cc="" fails=""
+    for dst in 1.1.1.1 8.8.8.8 9.9.9.9; do
+        if ping -I "$1" -c 1 -W 2 "$dst" &>/dev/null; then
+            ping_ok=1
+            break
+        fi
+    done
+    [[ -f "$EGRESS_OFF" ]] || cc=$(cf_country --interface "$1")
+    if [[ ${#IFACES[@]} -gt 1 ]] && systemctl is-active --quiet "wg-quick@$1"; then
+        fails=$(probe_fails "$1")
+    fi
+    printf '%s %s %s\n' "$ping_ok" "${cc:--}" "${fails:--}" > "${RUN_DIR}/if-$1"
+}
+
+for i in "${IFACES[@]}"; do measure "$i" & done
+if [[ ! -f "$EGRESS_OFF" ]]; then cf_country > "${RUN_DIR}/server" & fi
+wait
+
+SERVER_CC=$(cat "${RUN_DIR}/server" 2>/dev/null)
+declare -A PING_OK=() WARP_CC=() PROBE=() SLOW=()
+for i in "${IFACES[@]}"; do
+    p=""; c=""; f=""
+    [[ -f "${RUN_DIR}/if-$i" ]] && read -r p c f < "${RUN_DIR}/if-$i"
+    PING_OK[$i]=${p:-0}
+    [[ -n "$c" && "$c" != "-" ]] && WARP_CC[$i]=$c
+    [[ "$f" =~ ^[0-9]+$ ]] && PROBE[$i]=$f
+done
+
 if [[ ${#IFACES[@]} -gt 1 ]]; then
     best=9
-    for i in "${IFACES[@]}"; do
-        systemctl is-active --quiet "wg-quick@${i}" || continue
-        PROBE[$i]=$(probe_fails "$i")
+    for i in "${!PROBE[@]}"; do
         [[ ${PROBE[$i]} -lt $best ]] && best=${PROBE[$i]}
     done
     mkdir -p "$DRAIN_DIR"
@@ -1327,16 +1388,17 @@ if [[ ${#IFACES[@]} -gt 1 ]]; then
 fi
 
 # Every account is checked on its own: handshake age and a ping bound to its
-# interface. The ping does not go by fwmark: with several accounts the marked
-# path is a multipath route, and a probe on it tests whichever interface the
-# hash picks. A dead interface is drained — taken out of the shared route via a
-# marker in DRAIN_DIR — until it is healthy again, so its share of connections
-# does not vanish into it meanwhile. The routes helper never drains the last
-# interface, so with one account the route stays as it is.
+# interface (measured above). The ping does not go by fwmark: with several
+# accounts the marked path is a multipath route, and a probe on it tests
+# whichever interface the hash picks. A dead interface is drained — taken out
+# of the shared route via a marker in DRAIN_DIR — until it is healthy again,
+# so its share of connections does not vanish into it meanwhile. The routes
+# helper never drains the last interface, so with one account the route stays
+# as it is.
 check_iface() {
     local IFACE="$1" STATE_FILE="$2" CONF="/etc/wireguard/$1.conf" P="WARP Watchdog"
     local hs_ts now age ping_ok healthy mark fails last_rot reason server_cc warp_cc
-    local exp backoff try got dst rot
+    local exp backoff try got rot
     [[ ${#IFACES[@]} -gt 1 ]] && P="WARP Watchdog [${IFACE}]"
 
     # Silent by design when the operator stopped the tunnel on purpose. A unit
@@ -1357,14 +1419,7 @@ check_iface() {
     hs_ts=${hs_ts:-0}
     now=$(date +%s)
     age=$(( now - hs_ts ))
-
-    ping_ok=0
-    for dst in 1.1.1.1 8.8.8.8 9.9.9.9; do
-        if ping -I "$IFACE" -c 1 -W 2 "$dst" &>/dev/null; then
-            ping_ok=1
-            break
-        fi
-    done
+    ping_ok=${PING_OK[$IFACE]:-0}
 
     healthy=1
     [[ "$hs_ts" -eq 0 || $age -gt 180 ]] && healthy=0
@@ -1426,11 +1481,8 @@ check_iface() {
     # (--no-egress-check) nothing is probed and both stay unknown.
     reason="down"
     if [[ $healthy -eq 1 ]]; then
-        server_cc=""; warp_cc=""
-        if [[ ! -f "$EGRESS_OFF" ]]; then
-            server_cc=$(cf_country)
-            warp_cc=$(cf_country --interface "$IFACE")
-        fi
+        # Both measured above, and empty with --no-egress-check.
+        server_cc="$SERVER_CC"; warp_cc="${WARP_CC[$IFACE]:-}"
         if [[ -z "$server_cc" || -z "$warp_cc" || "$warp_cc" == "$server_cc" ]]; then
             [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
             return 0
