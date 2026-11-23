@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.6)
+#  VPS-WARP PRO (Xray Edition) - Ultimate Production Installer (v5.7)
 # ==============================================================================
 #
 #  Deliberately NOT using `set -euo pipefail`: the flow depends on many probes
@@ -13,7 +13,7 @@ APP_DIR="/opt/vps-warp"
 SCRIPT_LANG="en"
 
 # Bump on every release. Used by `vps-warp update` for version comparison.
-SCRIPT_VERSION="5.6"
+SCRIPT_VERSION="5.7"
 
 # Persistent state dir — NOT wiped by the cleanup step. Holds installed version,
 # the wgcf working directory and the watchdog's backoff state.
@@ -22,10 +22,13 @@ VERSION_FILE="${STATE_DIR}/version"
 LICENSE_FILE="${STATE_DIR}/license"
 WGCF_DIR="${STATE_DIR}/wgcf"
 WATCHDOG_STATE="${STATE_DIR}/watchdog.state"
-# Marker: the egress country check is off (installer flag --no-egress-check).
-# Read at run time by the watchdog and the CLI, so creating or removing it by
-# hand takes effect without a reinstall.
-EGRESS_OFF_FILE="${STATE_DIR}/no-egress-check"
+# Marker: the egress country check is ON (installer flag --egress-check; off
+# by default since 5.7). Read at run time by the watchdog and the CLI, so
+# creating or removing it by hand takes effect without a reinstall. Up to 5.6
+# the check was on by default and the marker meant the opposite; the installer
+# removes that old one (EGRESS_OFF_LEGACY).
+EGRESS_ON_FILE="${STATE_DIR}/egress-check"
+EGRESS_OFF_LEGACY="${STATE_DIR}/no-egress-check"
 # Number of WARP accounts (installer flag --accounts N). Kept here because
 # `vps-warp update` re-runs this script with no arguments. There is no upper
 # bound (since 5.6): the 10 of 5.0–5.5 had no measurement behind it, and a
@@ -239,7 +242,7 @@ function t() {
             "tuple_new") echo "Порт и endpoint:" ;;
             "geo_skip") echo "Не удалось определить страну сервера или выхода — проверка пропущена, её повторит watchdog" ;;
             "geo_fail") echo "Страна выхода не совпала со страной сервера (выход / сервер), watchdog продолжит попытки:" ;;
-            "geo_off") echo "Проверка выключена (--no-egress-check), включить: --egress-check" ;;
+            "geo_off") echo "Проверка выключена (так по умолчанию), включить: --egress-check" ;;
             "v6_on") echo "IPv6 через WARP включён (выключить: --no-ipv6)" ;;
             "v6_off") echo "IPv6 через WARP выключен (--no-ipv6), включить: --ipv6" ;;
             "v6_kernel") echo "IPv6 в ядре выключен (disable_ipv6) — WARP только по IPv4" ;;
@@ -295,7 +298,7 @@ function t() {
             "tuple_new") echo "Port and endpoint:" ;;
             "geo_skip") echo "Could not determine the server or egress country — check skipped, the watchdog will retry it" ;;
             "geo_fail") echo "Egress country does not match the server (egress / server), the watchdog will keep trying:" ;;
-            "geo_off") echo "Check is off (--no-egress-check), turn it back on with --egress-check" ;;
+            "geo_off") echo "Check is off (the default), turn it on with --egress-check" ;;
             "v6_on") echo "IPv6 through WARP is on (turn off: --no-ipv6)" ;;
             "v6_off") echo "IPv6 through WARP is off (--no-ipv6), turn it on with --ipv6" ;;
             "v6_kernel") echo "IPv6 is disabled in the kernel (disable_ipv6) — WARP stays IPv4-only" ;;
@@ -671,13 +674,16 @@ function client_id_of() {
 [[ $EUID -ne 0 ]] && fail "$(t "root_req")"
 
 # --- Options ---
-# --no-egress-check turns the egress country check off (installer and
-# watchdog), --egress-check turns it back on; without either, the previous
-# choice stands. It lives in STATE_DIR because `vps-warp update` re-runs this
-# script with no arguments.
-# Off is for setups where a different country is the very point of WARP (often
-# WARP chained into WARP, mostly on Russian hosts) — the check would keep
-# re-rolling it away — and for those where a mismatch simply does not matter.
+# --egress-check turns the egress country check on (installer and watchdog),
+# --no-egress-check turns it off; without either, the previous choice stands.
+# It lives in STATE_DIR because `vps-warp update` re-runs this script with no
+# arguments. Off by default since 5.7: a mismatch turned out to be rare and
+# temporary — on a Tokyo server about half the tuples came out as DE while its
+# address block was eight days old, and none of 60 three weeks later — and the
+# check costs a request per account on every watchdog run. Up to 5.6 it was on
+# by default, and an upgrade turns it off unless --egress-check is given.
+# Off also suits setups where a different country is the very point of WARP
+# (often WARP chained into WARP, mostly on Russian hosts).
 #
 # --accounts N (1 or more, no upper bound) sets how many WARP accounts share
 # the traffic; without it the previous number stands (1 on a first install).
@@ -711,9 +717,10 @@ ACCOUNTS=${ACCOUNTS_ARG:-$OLD_ACCOUNTS}
 IFACES=()
 for (( k = 1; k <= ACCOUNTS; k++ )); do IFACES+=("$(iface_of "$k")"); done
 case "$EGRESS_ARG" in
-    --no-egress-check) mkdir -p "$STATE_DIR" && touch "$EGRESS_OFF_FILE" ;;
-    --egress-check)    rm -f "$EGRESS_OFF_FILE" ;;
+    --egress-check)    mkdir -p "$STATE_DIR" && touch "$EGRESS_ON_FILE" ;;
+    --no-egress-check) rm -f "$EGRESS_ON_FILE" ;;
 esac
+rm -f "$EGRESS_OFF_LEGACY"
 case "$IPV6_ARG" in
     --no-ipv6) mkdir -p "$STATE_DIR" && touch "$NO_IPV6_FILE" ;;
     --ipv6)    rm -f "$NO_IPV6_FILE" ;;
@@ -898,7 +905,7 @@ step "🛠️  $(t "opt")"
 # already has, so an update does not silently move an exit; a new account picks
 # both at random from the pool (CF_SUBNETS / CF_PORTS at the top) — for anti-DPI
 # what matters is endpoint entropy, not the lowest ICMP RTT, hence no
-# scan_endpoints pass. The port is pinned with or without --no-egress-check:
+# scan_endpoints pass. The port is pinned whether the egress check is on or off:
 # the check relies on it, and with the check off it keeps an exit chosen by
 # `vps-warp rotate`. Only well-formed old values are reused (they go into sed).
 USED_PORTS=()
@@ -1190,7 +1197,7 @@ done
 
 # 8b. Egress country (see the note above cf_country), for every account
 step "🌍 $(t "geo")"
-if [[ -f "$EGRESS_OFF_FILE" ]]; then
+if [[ ! -f "$EGRESS_ON_FILE" ]]; then
     done_ "$(t "geo_off")"
 else
     SERVER_CC=$(cf_country)
@@ -1231,7 +1238,7 @@ for (( k = 1; k <= ACCOUNTS; k++ )); do STATES+=("$(state_of "$k")"); done
     printf 'STATES=(%s)\n'   "$(printf '%q ' "${STATES[@]}")"
     printf 'FWMARK=%q\n'     "$WARP_FWMARK"
     printf 'TABLE=%q\n'      "$WARP_TABLE"
-    printf 'EGRESS_OFF=%q\n' "$EGRESS_OFF_FILE"
+    printf 'EGRESS_ON=%q\n'  "$EGRESS_ON_FILE"
     printf 'ROUTES=%q\n'     "$ROUTES_HELPER"
     printf 'DRAIN_DIR=%q\n'  "$DRAIN_DIR"
     printf 'IPV6=%q\n'       "$USE_IPV6"
@@ -1279,8 +1286,16 @@ changed=0
 # --- Test connections (several accounts only) ---
 # Handshake and ping can both be fine on an account that loses most of its TCP
 # connections — the per-device limit, on one account of several. So every
-# account also opens a few real HTTPS connections through its own interface:
-# up to 8 requests to connectivity-check URLs, stopping at the 3rd failure.
+# account also opens a few real TCP connections through its own interface:
+# up to 8 HTTP requests to connectivity-check URLs, stopping at the 3rd failure.
+# Plain HTTP since 5.7, as connectivity checks commonly are (Throne's latency
+# test, for one, defaults to http://cp.cloudflare.com/): what is judged is the
+# TCP connect and that an answer comes back, and TLS added nothing to that but
+# ~8 KB of handshake per request. Watchdog traffic at 30 accounts (bench):
+# ~45 GB a month in 5.6 (HTTPS, country check on), ~12.6 GB over HTTP with
+# the check on, ~7.6 GB with it off, the default since 5.7. The price is that
+# a node on the path could answer in the server's place and make a broken
+# account look healthy; checks of this kind accept that.
 # A connection that took a second or more to open counts as a failure too:
 # through WARP the nearest Cloudflare machine accepts TCP within milliseconds,
 # so a second means the first SYN went unanswered and the kernel resent it —
@@ -1295,10 +1310,10 @@ changed=0
 # with no slow run between them, so it does not flap in and out. With one
 # account there is nowhere to move its connections, so nothing is probed.
 PROBE_URLS=(
-    https://www.google.com/generate_204
-    https://connectivitycheck.gstatic.com/generate_204
-    https://cp.cloudflare.com/generate_204
-    https://www.apple.com/library/test/success.html
+    http://www.google.com/generate_204
+    http://connectivitycheck.gstatic.com/generate_204
+    http://cp.cloudflare.com/generate_204
+    http://www.apple.com/library/test/success.html
 )
 probe_fails() {
     local i out code tc fails=0
@@ -1341,7 +1356,7 @@ measure() {   # iface
             break
         fi
     done
-    [[ -f "$EGRESS_OFF" ]] || cc=$(cf_country --interface "$1")
+    [[ -f "$EGRESS_ON" ]] && cc=$(cf_country --interface "$1")
     if [[ ${#IFACES[@]} -gt 1 ]] && systemctl is-active --quiet "wg-quick@$1"; then
         fails=$(probe_fails "$1")
     fi
@@ -1349,7 +1364,7 @@ measure() {   # iface
 }
 
 for i in "${IFACES[@]}"; do measure "$i" & done
-if [[ ! -f "$EGRESS_OFF" ]]; then cf_country > "${RUN_DIR}/server" & fi
+if [[ -f "$EGRESS_ON" ]]; then cf_country > "${RUN_DIR}/server" & fi
 wait
 
 SERVER_CC=$(cat "${RUN_DIR}/server" 2>/dev/null)
@@ -1478,10 +1493,10 @@ check_iface() {
     # geolocates to another country. A healthy tunnel can therefore still come out
     # in the wrong country. Unknown on either side is NOT a mismatch: a failed
     # probe must never churn the tunnel. With the check turned off
-    # (--no-egress-check) nothing is probed and both stay unknown.
+    # (the default since 5.7) nothing is probed and both stay unknown.
     reason="down"
     if [[ $healthy -eq 1 ]]; then
-        # Both measured above, and empty with --no-egress-check.
+        # Both measured above, and empty while the check is off.
         server_cc="$SERVER_CC"; warp_cc="${WARP_CC[$IFACE]:-}"
         if [[ -z "$server_cc" || -z "$warp_cc" || "$warp_cc" == "$server_cc" ]]; then
             [[ $fails -ne 0 ]] && printf '0 %s\n' "$last_rot" > "$STATE_FILE"
@@ -1598,7 +1613,7 @@ done_ "$(t "watchdog_ok")"
     printf 'RAW_URL=%q\n'        "$RAW_URL"
     printf 'VERSION_FILE=%q\n'   "$VERSION_FILE"
     printf 'STATE_DIR=%q\n'      "$STATE_DIR"
-    printf 'EGRESS_OFF=%q\n'     "$EGRESS_OFF_FILE"
+    printf 'EGRESS_ON=%q\n'      "$EGRESS_ON_FILE"
     printf 'APP_DIR=%q\n'        "$APP_DIR"
     printf 'IFACES=(%s)\n'       "$(printf '%q ' "${IFACES[@]}")"
     printf 'STATES=(%s)\n'       "$(printf '%q ' "${STATES[@]}")"
@@ -1691,18 +1706,18 @@ function show_status {
 
         # Egress country vs the server's own, as Cloudflare sees both. A mismatch
         # is what the watchdog re-rolls; `vps-warp rotate` re-rolls it by hand.
-        # With the check off (--no-egress-check) the line is informational only.
+        # With the check off (the default since 5.7) the line is informational only.
         warp_cc=$(cf_country --interface "$i")
         if [[ -z "$server_cc" || -z "$warp_cc" ]]; then
             c_geo="${C_GRY}"; t_geo="${warp_cc:-?} (server ${server_cc:-?})"
         elif [[ "$warp_cc" == "$server_cc" ]]; then
             c_geo="${C_GRN}"; t_geo="${warp_cc} (matches the server)"
-        elif [[ -f "$EGRESS_OFF" ]]; then
+        elif [[ ! -f "$EGRESS_ON" ]]; then
             c_geo="${C_GRY}"; t_geo="${warp_cc} — server is ${server_cc}"
         else
             c_geo="${C_YLW}"; t_geo="${warp_cc} — server is ${server_cc}, the watchdog will re-roll"
         fi
-        [[ -f "$EGRESS_OFF" ]] && t_geo+=", check off"
+        [[ -f "$EGRESS_ON" ]] || t_geo+=", check off"
 
         [[ $n -gt 1 ]] && lines+=("  ${C_BLD}${i}${C_RST}")
         lines+=("   ${C_GRY}Status:${C_RST}       ${c_stat}${t_stat}${C_RST}")
